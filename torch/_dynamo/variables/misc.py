@@ -1290,6 +1290,15 @@ class AutogradFunctionVariable(VariableTracker):
     ) -> VariableTracker:
         from torch.autograd.function import _SingleLevelFunction
 
+        if self.fn_cls.vmap is not torch.autograd.Function.vmap:
+            unimplemented(
+                gb_type="autograd.Function with custom vmap rule",
+                context=f"call_apply {self}",
+                explanation="Dynamo cannot trace a custom autograd.Function vmap rule. "
+                "Tracing forward directly would bypass the custom rule.",
+                hints=[*graph_break_hints.SUPPORTABLE],
+            )
+
         setup_ctx_src = (
             AttrSource(self.fn_cls_source, "setup_context")
             if self.fn_cls_source is not None

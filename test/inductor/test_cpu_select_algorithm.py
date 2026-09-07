@@ -39,6 +39,7 @@ from torch.testing._internal.common_utils import (
     TEST_ACL,
     TEST_MKL,
     xfailIf,
+    xfailIfS390X,
 )
 
 
@@ -1651,6 +1652,7 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
         vec_amx = VecAMX()
         self._check_amx_counter(vec_amx)
 
+    @xfailIfS390X
     @inductor_config.patch({"freezing": True})
     @patches
     @torch.no_grad

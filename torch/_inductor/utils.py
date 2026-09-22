@@ -4484,10 +4484,11 @@ def use_scatter_fallback(
     src_device_type: str,
     src_is_tensor: bool,
 ) -> bool:
+    # "none"/"last" is a plain overwrite, same codegen as no reduction at all
     if (
         op_overload.overloadpacket
         in (torch.ops.aten.scatter_reduce_, torch.ops.aten.scatter_reduce)
-        and reduction_type is None
+        and reduction_type in (None, "none", "last")
     ):
         return False
 

@@ -150,7 +150,7 @@ if(NOT BUILD_LIBTORCHLESS)
   endif()
 
   if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(s390x|ppc64le)$")
-    target_link_libraries(c10 INTERFACE "$<BUILD_INTERFACE:cpuinfo>")
+    target_include_directories(c10 INTERFACE "$<BUILD_INTERFACE:$<TARGET_PROPERTY:cpuinfo,INTERFACE_INCLUDE_DIRECTORIES>>")
     target_link_libraries(c10 PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,cpuinfo>")
   endif()
 

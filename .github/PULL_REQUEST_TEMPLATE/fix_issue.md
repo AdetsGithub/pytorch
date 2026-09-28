@@ -1,6 +1,6 @@
 # Fixing an Issue
 
-Please open this PR as a draft and mark it ready for review once the description and tests are complete.
+Please open this PR as a draft and mark it ready for review once the description and code are ready to be looked at.
 
 Before submitting, please review:
 - [PR lifecycle](https://github.com/pytorch/pytorch/blob/main/CONTRIBUTING.md#pr-lifecycle) in the contributing guide
@@ -10,7 +10,7 @@ Before submitting, please review:
 
 ## Issue
 
-Fixes #<!-- Number of an issue labeled "actionable". PRs without a linked actionable issue may be closed, unless the author has write access to the repo or uses the pre-approved PR template. -->
+Fixes #<!-- Number of an issue labeled "actionable". PRs without a linked actionable issue will be automatically closed, unless the author has write access to the repo or uses the pre-approved PR template. -->
 
 ## Summary
 

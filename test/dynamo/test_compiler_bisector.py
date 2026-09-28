@@ -175,25 +175,6 @@ class TestCompilerBisector(TestCase):
         self.assertEqual(out.bisect_number, 4)
         self.assertTrue("joint_custom_post_pass" in out.debug_info)
 
-    def test_rng(self):
-        def foo():
-            return torch.rand([10], device=GPU_TYPE) + 1
-
-        def test_fn():
-            torch._dynamo.reset()
-
-            with preserve_rng_state():
-                out = foo()
-            with preserve_rng_state():
-                out_c = torch.compile(foo)()  # noqa: UNSPECIFIED_BACKEND
-
-            return torch.allclose(out, out_c)
-
-        out = CompilerBisector.do_bisect(test_fn)
-        self.assertEqual(out.backend, "inductor")
-        self.assertEqual(out.subsystem, "inductor_fallback_random")
-        self.assertTrue("inductor_fallback_random" in out.debug_info)
-
     def test_crossref(self):
         with _scoped_library(self.test_ns, "FRAGMENT") as lib:
             lib.define("foo(Tensor x) -> Tensor")
@@ -422,6 +403,26 @@ class TestCompilerBisectorDevice(TestCase):
             "Debug info: <OpOverload(op='aten.exponential', overload='default')>"
         )
         self.assertIn(expected_result, output.stdout)
+    @unittest.skipIf(not has_triton(), "requires Triton")
+    def test_rng(self, device):
+        def foo():
+            return torch.rand([10], device=device) + 1
+
+        def test_fn():
+            torch._dynamo.reset()
+
+            with preserve_rng_state():
+                out = foo()
+            with preserve_rng_state():
+                out_c = torch.compile(foo)()  # noqa: UNSPECIFIED_BACKEND
+
+            return torch.allclose(out, out_c)
+
+        out = CompilerBisector.do_bisect(test_fn)
+        self.assertEqual(out.backend, "inductor")
+        self.assertEqual(out.subsystem, "inductor_fallback_random")
+        self.assertTrue("inductor_fallback_random" in out.debug_info)
+
 
 
 instantiate_device_type_tests(

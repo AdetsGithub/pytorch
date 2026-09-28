@@ -41,6 +41,9 @@ from torch.testing._internal.common_cuda import (
     SM120OrLater,
     TEST_CUDA,
 )
+from torch._inductor.kernel.flex_gemm.quack_ops.grouped_reduce import (
+    SM120_FEED_MAIN_MAX_GROUP,
+)
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_quantized import (
     _bfloat16_to_float4_e2m1fn_x2,
@@ -1211,6 +1214,24 @@ class TestFlexGemmRuntimeHelpers(TestCase):
 
 
 class FlexGemmTestCase(TestCase):
+    def assertRaisesInChain(self, exc_type, text, fn, *args, **kwargs):
+        """Run ``fn`` and require an ``exc_type`` whose message contains ``text``
+        somewhere in the raised exception's cause/context chain (Inductor wraps
+        lowering errors in InductorError / LoweringException)."""
+        with self.assertRaises(Exception) as cm:
+            fn(*args, **kwargs)
+        exc = cm.exception
+        seen = []
+        while exc is not None and exc not in seen:
+            seen.append(exc)
+            if isinstance(exc, exc_type) and text in str(exc):
+                return exc
+            exc = exc.__cause__ or exc.__context__
+        self.fail(
+            f"expected {exc_type.__name__} containing {text!r} in the exception "
+            f"chain, got {type(cm.exception).__name__}: {str(cm.exception)[:300]}"
+        )
+
     K, N = 32, 16
 
     @classmethod
@@ -5402,6 +5423,23 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     def test_mm_local_m_reduce_result_feeds_main_output(self, group):
         m = 128
         n = 64
+        if SM120OrLater and group > SM120_FEED_MAIN_MAX_GROUP:
+            # sm_120's mma.sync epilogue gives each of the 8 M lanes two rows of a
+            # 16-row group; grouped feed-main reduces across lanes only, so the
+            # config gate rejects the group up front. group == 8 (one row per
+            # lane) runs and must match eager on sm_120 - the boundary case.
+            self.assertRaisesInChain(
+                ValueError,
+                "grouped feed-main on sm_120 supports M groups up to 8",
+                self._run_local_m_reduce_result_feeds_main_output,
+                m,
+                n,
+                group,
+            )
+            return
+        self._run_local_m_reduce_result_feeds_main_output(m, n, group)
+
+    def _run_local_m_reduce_result_feeds_main_output(self, m, n, group):
 
         def epilogue_fn(acc):
             x = acc.float().view(-1, group, n)
@@ -5826,6 +5864,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         b = torch.rand(64, n, device="cuda", dtype=torch.bfloat16)
         for group in (8, 16):
             fn, epilogue_fn = make_fn(group)
+            if SM120OrLater and group > SM120_FEED_MAIN_MAX_GROUP:
+                self.assertRaisesInChain(
+                    ValueError,
+                    "grouped feed-main on sm_120 supports M groups up to 8",
+                    torch.compile(fn, backend="inductor", fullgraph=True),
+                    a,
+                    b,
+                )
+                continue
             actual, (code,) = run_and_get_code(
                 torch.compile(fn, backend="inductor", fullgraph=True), a, b
             )
@@ -5869,6 +5916,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         b = torch.rand(64, n, device="cuda", dtype=torch.bfloat16)
         for group in (8, 16):
             fn, epilogue_fn = make_fn(group)
+            if SM120OrLater and axis == 0 and group > SM120_FEED_MAIN_MAX_GROUP:
+                self.assertRaisesInChain(
+                    ValueError,
+                    "grouped feed-main on sm_120 supports M groups up to 8",
+                    torch.compile(fn, backend="inductor", fullgraph=True),
+                    a,
+                    b,
+                )
+                continue
             actual = torch.compile(fn, backend="inductor", fullgraph=True)(a, b)
             self.assertMatchesEpilogue(
                 actual,

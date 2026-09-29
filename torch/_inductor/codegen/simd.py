@@ -611,6 +611,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
     ) -> str:
         """Generate template source code with fused prologues and epilogues.
 
+        ``prologue_nodes`` are upstream of the template node. Their code may be
+        emitted in either the template's load-input or store-output region.
+
         Subclasses override this to implement custom code generation.
         The default implementation raises NotImplementedError — the actual
         standard path lives in ``TritonTemplateKernel.codegen_template_body``.
@@ -4469,21 +4472,53 @@ class SIMDScheduling(BaseScheduling):
         *,
         only_gen_src_code=False,
     ):
-        """
-        Helper method to codegen a single template kernel variant
+        """Codegen a single template kernel variant.
+
+        ``prologue_nodes`` are upstream of the template node. Their producer groups
+        are routed to either the template's load-input or store-output region.
+
+        Template fusion has three codegen placements:
+
+        1. Load-input prologue fusion: producers of named template inputs such as
+           A/B are generated in LOAD_INPUT_A / LOAD_INPUT_B. Their values
+           participate in the main accumulator loop.
+        2. Store-output input-producer fusion: producers of inputs consumed by
+           STORE_OUTPUT are generated before the manual epilogue. Currently, only
+           prefix inputs are supported.
+        3. Output epilogue fusion: consumers of the template result, such as relu
+           or multiply, are generated after epilogue_fn and before the final store.
         """
         buf_name_to_prologue_group = {}
         template_reads = template_node.used_buffer_names()
+        prefix_inputs_fusion_names = OrderedSet(
+            kernel.input_nodes[index].get_name()
+            for index in kernel.prefix_inputs_fusion_indices
+        )
+        named_input_names = OrderedSet(
+            input_node.get_name()
+            for input_node in kernel.input_nodes[
+                kernel.prefix_args : len(kernel.input_nodes) - kernel.suffix_args
+            ]
+        )
         prologue_group = []
         for prologue in prologue_nodes:
             names = prologue.get_buffer_names()
             prologue_group.append(prologue)
-            # this must be the end of a prologue group
+            # Scheduler ordering keeps the nodes for each template input
+            # contiguous. Accumulate nodes until one produces a buffer read
+            # directly by the template, which completes the producer group.
             if names & template_reads:
                 if len(names) != 1:
                     raise AssertionError(f"expected len(names) == 1, got {len(names)}")
-                buf_name_to_prologue_group[next(iter(names))] = prologue_group
-                kernel.prologue_fused_inputs.add(next(iter(names)))
+                input_name = next(iter(names))
+                if input_name in prefix_inputs_fusion_names:
+                    kernel.store_output_input_producer_groups[input_name] = (
+                        prologue_group
+                    )
+                    kernel.store_output_fused_inputs.add(input_name)
+                if input_name in named_input_names:
+                    buf_name_to_prologue_group[input_name] = prologue_group
+                    kernel.load_input_fused_inputs.add(input_name)
                 prologue_group = []
 
         # all prologue groups should have finalized with use in template
@@ -4492,9 +4527,10 @@ class SIMDScheduling(BaseScheduling):
                 f"expected empty prologue_group, got {len(prologue_group)}"
             )
 
-        # Remove prologue-fused inputs from input_buffers so that
+        # Remove producer-fused inputs from input_buffers so that
         # remove_kernel_local_buffers can remove them.
-        for buf_name in kernel.prologue_fused_inputs:
+        fused_inputs = kernel.load_input_fused_inputs | kernel.store_output_fused_inputs
+        for buf_name in fused_inputs:
             kernel.args.input_buffers.pop(buf_name, None)
 
         # Dispatch to the kernel for source generation.  TritonTemplateKernel
@@ -4597,7 +4633,10 @@ class SIMDScheduling(BaseScheduling):
         hint_override: int | None = None,
     ) -> str | None:
         """
-        Codegen a triton template with multi-kernel dispatch support
+        Codegen a triton template with multi-kernel dispatch support.
+
+        ``prologue_nodes`` are upstream of the template node. Their code may be
+        emitted in either the template's load-input or store-output region.
 
         If `only_gen_src_code=True` the src code will be returned instead of being
         codegenned into the wrapper

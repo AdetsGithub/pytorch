@@ -50,7 +50,6 @@ from torch import SymInt
 from torch._custom_class_base import CustomClassBase
 from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo.graph_bytecode_inputs import (
-    CURRENT_STREAM_INDEX,
     get_external_object_by_index,
     register_user_object,
 )
@@ -1627,8 +1626,9 @@ class VariableBuilder:
         elif isinstance(value, torch.Stream):
             self.install_guards(GuardBuilder.TYPE_MATCH)
             if isinstance(self.source, CurrentStreamSource):
-                # Reuse the index pre-allocated in SymbolicStreamState.__init__
-                index = CURRENT_STREAM_INDEX
+                index = self.source.user_object_index
+                if index is None:
+                    raise AssertionError("Current stream source must have an index")
             else:
                 index = register_user_object(value, self.source)
             stream_proxy = self.tx.output.create_proxy(

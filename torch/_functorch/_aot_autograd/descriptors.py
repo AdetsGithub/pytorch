@@ -326,7 +326,21 @@ import dataclasses
 
 @dataclasses.dataclass(frozen=True)
 class AOTInput:
-    """Describes where an input from an AOTAutograd produced FX graph comes from"""
+    """Describes where an input from an AOTAutograd produced FX graph comes from.
+
+    ``dynamo_input_indices`` preserves the original graph-input owners while
+    AOT wrappers change the calling convention.
+    """
+
+    dynamo_input_indices: tuple[int, ...] = dataclasses.field(
+        default=(), kw_only=True, compare=False, repr=False
+    )
+
+    def with_dynamo_inputs(self, *, indices: tuple[int, ...]) -> "AOTInput":
+        return dataclasses.replace(
+            self,
+            dynamo_input_indices=indices,
+        )
 
     def expr(self) -> str:
         raise NotImplementedError("Subclasses must implement expr()")

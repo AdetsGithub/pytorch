@@ -27,8 +27,10 @@ from torch._custom_class_base import CustomClassBase
 from torch._dynamo import config as dynamo_config
 from torch._dynamo.callback import callback_handler, CallbackTrigger
 from torch._dynamo.graph_bytecode_inputs import (
+    current_stream_device_to_index,
     index_to_external_object_weakref,
     set_external_object_by_index,
+    store_current_stream_indices,
 )
 from torch._dynamo.utils import (
     CompileEventLogger,
@@ -122,6 +124,14 @@ def _snapshot_external_objects(ctx: Any) -> None:
         for k, ref in enumerate(index_to_external_object_weakref)
         if ref() is not None
     }
+    for (device_type, device_index), index in current_stream_device_to_index.items():
+        if index not in ctx._external_objects:
+            ctx._external_objects[index] = torch.accelerator.current_stream(
+                torch.device(device_type, device_index)
+            )
+    ctx._external_stream_indices = tuple(
+        (*device, index) for device, index in current_stream_device_to_index.items()
+    )
 
 
 def _unwrap_tensor_subclasses_no_symints(
@@ -1726,6 +1736,17 @@ class AOTDedupeWrapper(CompilerWrapper):
         # have a record that these were duped, perhaps as a mutable attribute
         # on the kept arg?  Do this if someone needs it
         deduped_flat_args_descs = self.remove_dupe_args(flat_args_descs)
+        deduped_input_indices = [set() for _ in deduped_flat_args_descs]
+        for desc, deduped_index in zip(flat_args_descs, add_dupe_map):
+            deduped_input_indices[deduped_index].update(desc.dynamo_input_indices)
+        deduped_flat_args_descs = [
+            desc.with_dynamo_inputs(indices=tuple(sorted(indices)))
+            for desc, indices in zip(
+                deduped_flat_args_descs,
+                deduped_input_indices,
+                strict=True,
+            )
+        ]
 
         # Update our input metadata to remove duped input metadata.
         updated_fw_metadata = remove_dupe_metadata(
@@ -2324,6 +2345,17 @@ def merge_view_inputs(
         aliases_with_none_bases = [
             fwd_inputs[i] for i in aliased_input_indices if fwd_inputs[i]._base is None
         ]
+        dynamo_input_indices = tuple(
+            sorted(
+                {
+                    dynamo_index
+                    for input_index in aliased_input_indices
+                    for dynamo_index in fwd_inputs_descs[
+                        input_index
+                    ].dynamo_input_indices
+                }
+            )
+        )
         synthetic_base_desc: AOTInput
         if len(non_none_bases) == 0:
             # Case where none of the aliases have a ._base
@@ -2359,11 +2391,17 @@ def merge_view_inputs(
             # We don't actually have a convenient way of going from storage -> tensor,
             # So using set_() here (we suffer some minor overhead, but this case is rare).
             synthetic_base.set_(example_alias.untyped_storage())
-            synthetic_base_desc = SyntheticBaseAOTInput(fwd_inputs_descs[example_idx])
+            synthetic_base_desc = SyntheticBaseAOTInput(
+                fwd_inputs_descs[example_idx],
+                dynamo_input_indices=dynamo_input_indices,
+            )
         else:
             # Case where all of the aliases require gradients, and have the same _base.
             i, synthetic_base = non_none_bases[0]
-            synthetic_base_desc = ViewBaseAOTInput(fwd_inputs_descs[i])
+            synthetic_base_desc = ViewBaseAOTInput(
+                fwd_inputs_descs[i],
+                dynamo_input_indices=dynamo_input_indices,
+            )
             for j, other_base in non_none_bases[1:]:
                 if other_base is not synthetic_base:
                     raise AssertionError(
@@ -3629,6 +3667,8 @@ class _AOTDispatchAutogradFunctionFactory:
 
                 for idx, obj in getattr(ctx, "_external_objects", {}).items():
                     set_external_object_by_index(idx, obj)
+                if hasattr(ctx, "_external_stream_indices"):
+                    store_current_stream_indices(ctx._external_stream_indices)
 
                 return call_func_at_runtime_with_args(
                     compiled_bw,

@@ -70,7 +70,7 @@ from torch._guards import (
 )
 from torch._library.fake_class_registry import FakeScriptObject
 from torch._library.opaque_object import is_custom_class
-from torch._subclasses.fake_tensor import FakeTensor
+from torch._subclasses.fake_tensor import FakeTensor, is_fake_tensor
 from torch._utils_internal import signpost_event
 from torch.export.dynamic_shapes import _ConstraintTarget
 from torch.fx._lazy_graph_module import _make_graph_module  # type: ignore[attr-defined]
@@ -115,7 +115,11 @@ from .exc import (
     unimplemented,
     unimplemented_with_warning,
 )
-from .graph_bytecode_inputs import has_user_objects, index_to_bytecode_constructor
+from .graph_bytecode_inputs import (
+    current_stream_device_to_index,
+    has_user_objects,
+    index_to_bytecode_constructor,
+)
 from .graph_deduplication import apply_graph_deduplication
 from .graph_id_filter import (
     get_backend_override_for_compile_id,
@@ -206,6 +210,25 @@ RootGuardManager = guards.RootGuardManager
 TensorMetadataDim = int | torch.SymInt | None
 TensorMetadataSequence = Sequence[TensorMetadataDim]
 OutputReturnKind = Literal["graph_out", "input", "constant"]
+InputMutation = tuple[traceback.StackSummary, OrderedSet[Source | None]]
+InputMutations = dict[str, tuple[InputMutation, ...]]
+
+
+def _fake_tensors_overlap(first: Any, second: Any) -> bool:
+    if not (
+        is_fake_tensor(first)
+        and is_fake_tensor(second)
+        and torch._C._is_alias_of(first, second)
+    ):
+        return False
+    if first.element_size() != second.element_size():
+        return True
+    symbolic = any(
+        isinstance(value, torch.SymInt)
+        for tensor in (first, second)
+        for value in (*tensor.shape, *tensor.stride(), tensor.storage_offset())
+    )
+    return bool(guards.compute_overlapping_tensors([first, second], symbolic=symbolic))
 
 
 class SizesStridesInfo(TypedDict):
@@ -883,13 +906,15 @@ class OutputGraph(OutputGraphCommon):
         # and restore_graphstate
         self.timestamp = 0
 
-        # Maps stream id (id(stream_value)) → user stack trace for input
-        # mutations on that stream.  Used to error when an event records on a
-        # stream that already has an input mutation (the epilogue copy_()
-        # wouldn't be captured).  We key by id() of the underlying
-        # torch.Stream so we can peek lazy variables without realizing them.
-        self._input_mutation_streams: dict[int, traceback.StackSummary] = {}
-        self._last_checked_input_versions: dict[int, int] | None = None
+        # Maps input source names and runtime streams to mutation stacks and
+        # sources. Distinct wrappers can represent one stream.
+        self._input_mutation_streams: dict[
+            str,
+            dict[tuple[str, int | None, int], InputMutation],
+        ] = {}
+        self._input_mutation_candidates: dict[
+            StorageWeakRef, list[tuple[torch.Tensor, Source]]
+        ] = collections.defaultdict(list)
 
         # A list of register_finalizer_fns to apply to the output graph module
         self.register_finalizer_fns: list[Callable[[fx.GraphModule], None]] = []
@@ -1322,38 +1347,137 @@ class OutputGraph(OutputGraphCommon):
         return len(self.tracers) == 1
 
     def check_input_mutation_on_current_stream(
-        self, tx: "InstructionTranslatorBase"
+        self,
+        tx: "InstructionTranslatorBase",
+        mutated_tensors: Sequence[variables.TensorVariable],
     ) -> None:
-        """Record which stream index has input mutations by comparing current
-        tensor versions against the versions captured at graph input creation."""
+        """Record mutated graph inputs and their streams."""
         if not hasattr(tx, "symbolic_stream_state"):
             return
-        if not tx.symbolic_stream_state.in_stream_context():
+
+        from torch.multiprocessing.reductions import StorageWeakRef
+
+        from .variables.streams import stream_identity
+
+        accelerator = torch.accelerator.current_accelerator()
+        if accelerator is None:
             return
-
-        tracer = self.root_tracer
-        if self._last_checked_input_versions is None:
-            self._last_checked_input_versions = dict(
-                enumerate(tracer._input_versions_at_beginning)
-            )
-
-        cur_stream_index = tx.symbolic_stream_state.cur_stream_id()
-        input_idx = 0
-        for node in tracer.graph.nodes:
-            if node.op != "placeholder":
-                break
-            example_value = node.meta.get("example_value")
-            if not isinstance(example_value, torch.Tensor):
+        mutated_values = (
+            tensor.as_proxy().node.meta.get("example_value")
+            for tensor in mutated_tensors
+        )
+        seen_sources: set[str] = set()
+        for mutated_value in mutated_values:
+            if (
+                not isinstance(mutated_value, torch.Tensor)
+                or mutated_value.device.type != accelerator.type
+                or not torch._C._has_storage(mutated_value)
+            ):
                 continue
-            prev_version = self._last_checked_input_versions.get(input_idx)
-            cur_version = example_value._version
-            if prev_version is not None and cur_version > prev_version:
-                if cur_stream_index not in self._input_mutation_streams:
-                    self._input_mutation_streams[cur_stream_index] = (
-                        TracingContext.extract_stack()
-                    )
-                self._last_checked_input_versions[input_idx] = cur_version
-            input_idx += 1
+            storage = StorageWeakRef(mutated_value._typed_storage())
+            for example_value, source in self._input_mutation_candidates.get(
+                storage, ()
+            ):
+                if source.name in seen_sources or not _fake_tensors_overlap(
+                    mutated_value, example_value
+                ):
+                    continue
+                seen_sources.add(source.name)
+                cur_stream = tx.symbolic_stream_state.cur_stream(example_value.device)
+                if (
+                    isinstance(cur_stream, variables.LazyVariableTracker)
+                    and not cur_stream.is_realized()
+                ):
+                    cur_stream_value = cur_stream.peek_value()
+                else:
+                    cur_stream_value = cur_stream.value
+                cur_stream_key = stream_identity(cur_stream_value)
+                input_mutations = self._input_mutation_streams.setdefault(
+                    source.name, {}
+                )
+                mutation = input_mutations.get(cur_stream_key)
+                if mutation is None:
+                    mutation = (TracingContext.extract_stack(), OrderedSet())
+                    input_mutations[cur_stream_key] = mutation
+                mutation[1].add(cur_stream.source)
+
+    def register_input_mutation_candidate(
+        self, value: torch.Tensor, source: Source | None
+    ) -> None:
+        accelerator = torch.accelerator.current_accelerator()
+        if (
+            source is None
+            or accelerator is None
+            or value.device.type != accelerator.type
+            or not torch._C._has_storage(value)
+        ):
+            return
+        from torch.multiprocessing.reductions import StorageWeakRef
+
+        storage = StorageWeakRef(value._typed_storage())
+        self._input_mutation_candidates[storage].append((value, source))
+
+    def input_mutation_barrier_inputs(
+        self,
+        streams: Sequence[variables.StreamVariable] = (),
+        *,
+        device: torch.device | None = None,
+    ) -> InputMutations:
+        """Return input mutations ordered by a traced barrier."""
+        if not self._input_mutation_streams:
+            return {}
+        if streams and device is not None:
+            raise AssertionError("A stream barrier cannot also be a device barrier")
+
+        from .variables.streams import stream_identity
+
+        if streams:
+            matching_streams = {stream_identity(stream.value) for stream in streams}
+            sources = [stream.source for stream in streams]
+            sources.extend(
+                source
+                for input_mutations in self._input_mutation_streams.values()
+                for _, mutation_sources in input_mutations.values()
+                for source in mutation_sources
+            )
+            for source in sources:
+                if source is not None:
+                    install_guard(source.make_guard(GuardBuilder.EQUALS_MATCH))
+        else:
+            if device is None:
+                raise AssertionError("A barrier must specify streams or a device")
+            matching_streams = {
+                identity
+                for input_mutations in self._input_mutation_streams.values()
+                for identity in input_mutations
+                if identity[:2] == (device.type, device.index)
+            }
+
+        return {
+            input_name: tuple(
+                mutation
+                for identity, mutation in input_mutations.items()
+                if identity in matching_streams
+            )
+            for input_name, input_mutations in self._input_mutation_streams.items()
+            if any(identity in matching_streams for identity in input_mutations)
+        }
+
+    def mark_input_mutation_barrier(
+        self,
+        barrier: fx.Node,
+        streams: Sequence[variables.StreamVariable] = (),
+        *,
+        device: torch.device | None = None,
+        mutation_inputs: InputMutations | None = None,
+    ) -> None:
+        from .variables.streams import INPUT_MUTATION_BARRIER_INPUTS
+
+        if mutation_inputs is None:
+            mutation_inputs = self.input_mutation_barrier_inputs(streams, device=device)
+        barrier.meta.setdefault("custom", {})[INPUT_MUTATION_BARRIER_INPUTS] = (
+            frozenset(mutation_inputs)
+        )
 
     _EVENT_INPUT_MUTATION_FIX = (
         "To fix this, either:\n"
@@ -1367,14 +1491,19 @@ class OutputGraph(OutputGraphCommon):
         "  4. Record the event on a stream that has no input mutations."
     )
 
-    def check_event_record_after_input_mutation(self, stream_index: int) -> None:
+    def check_event_record_after_input_mutation(
+        self,
+        input_mutations: InputMutations,
+    ) -> None:
         """Error if an event is being recorded on a stream that already has
         an input mutation. Called at record time so ordering is naturally
         respected — records before mutations won't trigger this."""
-        if stream_index not in self._input_mutation_streams:
+        if not input_mutations:
             return
 
-        mutation_stack = self._input_mutation_streams[stream_index]
+        mutation_stack = next(
+            stack for mutations in input_mutations.values() for stack, _ in mutations
+        )
         record_stack = TracingContext.extract_stack()
 
         msg = (
@@ -1690,6 +1819,9 @@ class OutputGraph(OutputGraphCommon):
                     tracer.create_proxy("get_attr", module_key, (), {}),
                     example_value=target,
                     **options,
+                )
+                self.register_input_mutation_candidate(
+                    vt.as_proxy().node.meta["example_value"], source
                 )
 
                 # Track the object so to avoid duplicate registration in case of
@@ -3181,6 +3313,20 @@ class OutputGraph(OutputGraphCommon):
                 cg.call_function(len(index_to_bytecode_constructor), False)
                 cg.pop_top()
 
+                cg.add_push_null(
+                    lambda: cg.load_import_from(
+                        torch._dynamo.graph_bytecode_inputs.__name__,
+                        "store_current_stream_indices",
+                    )
+                )
+                current_stream_indices = tuple(
+                    (*device, index)
+                    for device, index in current_stream_device_to_index.items()
+                )
+                cg.append_output(cg.create_load_const(current_stream_indices))
+                cg.call_function(1, False)
+                cg.pop_top()
+
             for idx, arg in enumerate(self.graphargs):
                 self.export_metadata.graph_input_idx_to_local_source[idx] = arg.source
 
@@ -4355,6 +4501,10 @@ class SubgraphTracer(fx.Tracer):
         with ctx:
             proxy = self.create_proxy("placeholder", name, (), {}, type_expr=type_expr)
             set_example_value(proxy.node, example_value)
+            if self.parent is None and isinstance(example_value, torch.Tensor):
+                self.output_graph.register_input_mutation_candidate(
+                    example_value, source
+                )
             if self.input_name_to_proxy and before:
                 k, v = self.input_name_to_proxy.popitem()
                 self.input_name_to_proxy[name] = proxy

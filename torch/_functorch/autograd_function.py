@@ -822,6 +822,12 @@ class AutogradFunctionApply(HigherOrderOperator):
         non_differentiable_idx = fwd_kwargs["non_differentiable_idx"]
         saved_for_backward_idx = fwd_kwargs["saved_for_backward_idx"]
 
+        # Interpreter propagates body-node metadata over the surrounding
+        # backward tracing metadata, so pin the entire body to the backward.
+        for node in bwd.graph.nodes:
+            if node.op == "call_function":
+                node.meta["partitioner_tag"] = "must_be_in_backward"
+
         class ApplyTemplate(torch.autograd.Function):
             @staticmethod
             def forward(*args: Any, **kwargs: Any) -> Any:

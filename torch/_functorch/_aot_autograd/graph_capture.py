@@ -382,7 +382,7 @@ def aot_dispatch_base_graph(
     # there should be *NO* mutating ops in the graph at this point.
     if not aot_config.disable_functionalization:
         copy_count = assert_functional_graph(fw_module.graph)
-        assign_epilogue_copy_streams(fw_module)
+        assign_epilogue_copy_streams(fw_module, fw_metadata)
         # Wrap sync nodes with control_deps to prevent reordering
         wrap_all_sync_nodes_with_control_deps(fw_module)
         # Populate fw_metadata with stream indices from the compiled graph
@@ -556,7 +556,7 @@ def aot_dispatch_autograd_graph(
     # After copying metadata, assign streams to gradient accumulation nodes
     assign_backward_streams(fx_g)
 
-    assign_epilogue_copy_streams(fx_g)
+    assign_epilogue_copy_streams(fx_g, fw_metadata)
 
     # Insert syncs for newly assigned backward streams
     insert_backward_syncs(fx_g)

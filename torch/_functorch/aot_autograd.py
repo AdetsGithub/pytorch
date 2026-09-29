@@ -503,6 +503,11 @@ def create_aot_state(
     We use this to assume that parameters/buffer's shapes don't change.
     """
 
+    flat_args_descs = [
+        desc.with_dynamo_inputs(indices=(index,))
+        for index, desc in enumerate(flat_args_descs)
+    ]
+
     # Old name for now to avoid messing with stats.  Also, note this is pushed
     # on the stack, so it extends BEYOND this function
     stack.enter_context(

@@ -58,7 +58,7 @@ from torch import Tensor
 from torch._custom_class_base import CustomClassBase
 from torch._dynamo.callback import CallbackTrigger
 from torch._dynamo.graph_bytecode_inputs import (
-    CURRENT_STREAM_INDEX,
+    get_current_stream_index,
     set_external_object_by_index,
 )
 from torch._dynamo.mutation_guard import GenerationTracker
@@ -703,15 +703,16 @@ def _use_cuda_memory_pool_manager(
 
 
 @contextlib.contextmanager
-def _update_current_stream_external_object() -> Generator[None, None, None]:
+def _update_current_stream_external_object(device: int) -> Generator[None, None, None]:
     """Update the external object registry so custom ops see the capture stream.
 
     During cudagraph recording/warmup the current stream differs from the
-    trace-time default stream.  The external object at CURRENT_STREAM_INDEX
-    must reflect the actual current stream so that custom ops (e.g. event
-    record/wait) executed during capture use the right stream.
+    trace-time default stream. The registered current-stream object for the
+    capture device must reflect the actual current stream.
     """
-    set_external_object_by_index(CURRENT_STREAM_INDEX, torch.cuda.current_stream())
+    index = get_current_stream_index(torch.device("cuda", device))
+    if index is not None:
+        set_external_object_by_index(index, torch.cuda.current_stream(device))
     yield
 
 
@@ -825,7 +826,7 @@ class CUDAWarmupNode:
                 self.device_index, self.cuda_graphs_pool, self.stream
             ),
             # NB: must go after _use_cuda_memory_pool_manager which switches the stream
-            _update_current_stream_external_object(),
+            _update_current_stream_external_object(self.device_index),
             ControlFlowOpWarmupDispatchMode(),
             get_history_recording(),
         ):
@@ -1491,7 +1492,7 @@ class CUDAGraphNode:
                     self.device, self.cuda_graphs_pool, self.stream
                 ),
                 # NB: must go after _use_cuda_memory_pool_manager which switches the stream
-                _update_current_stream_external_object(),
+                _update_current_stream_external_object(self.device),
                 ControlFlowOpWarmupDispatchMode(),
                 get_history_recording(),
             ):
@@ -1537,7 +1538,7 @@ class CUDAGraphNode:
                 capture_error_mode="thread_local",
             ),
             # NB: must go after torch.cuda.graph which switches the stream
-            _update_current_stream_external_object(),
+            _update_current_stream_external_object(self.device),
             CUDAGraphCaptureControlFlowOpDispatchMode(),
             get_history_recording(),
         ):

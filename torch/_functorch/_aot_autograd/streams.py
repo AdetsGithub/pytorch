@@ -5,8 +5,15 @@ from typing import Any, TYPE_CHECKING, TypeAlias
 import torch.fx
 import torch.fx.traceback
 import torch.utils._pytree as pytree
+from torch._dynamo.graph_bytecode_inputs import get_external_object_by_index
 from torch._dynamo.graph_utils import _get_flat_args
-from torch._dynamo.variables.streams import get_current_stream, new_event
+from torch._dynamo.variables.streams import (
+    get_current_stream,
+    INPUT_MUTATION_BARRIER_INDICES,
+    INPUT_MUTATION_BARRIER_INPUTS,
+    new_event,
+    stream_identity,
+)
 from torch.fx.node import map_arg
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._runtime_estimation import (
@@ -20,6 +27,7 @@ from torch.utils._runtime_estimation import (
 if TYPE_CHECKING:
     from .schemas import ViewAndMutationMeta
 
+from .descriptors import AOTInput, InputMutationAOTOutput, SubclassGetAttrAOTOutput
 from .indexed_dict import IndexedDict
 
 
@@ -41,6 +49,14 @@ _SYNC_OPS = (
     torch.ops.streams.synchronize_device.default,
     torch.ops.streams.synchronize_stream.default,
 )
+
+_EPILOGUE_COPY_BARRIERS = (
+    torch.ops.streams.record_event.default,
+    torch.ops.streams.wait_stream.default,
+    torch.ops.streams.synchronize_device.default,
+    torch.ops.streams.synchronize_stream.default,
+)
+_EPILOGUE_COPY_DEPS = "epilogue_copy_deps"
 
 
 def get_roofline_estimate(node: Node) -> float:
@@ -328,12 +344,160 @@ def sync_deallocations(gm: torch.fx.GraphModule) -> None:
                 )
 
 
-def assign_epilogue_copy_streams(gm: torch.fx.GraphModule) -> None:
-    for epi_copy in gm.graph.find_nodes(op="call_function", target=aten.copy_.default):
-        arg_stream = get_stream(epi_copy.args[1])
+def _barrier_may_order_stream(
+    barrier: Node,
+    stream: int | None,
+    device: torch.device,
+    input_indices: tuple[int, ...],
+    *,
+    has_writeback: bool = False,
+) -> bool:
+    custom = barrier.meta.get("custom", {})
+    mutation_inputs = custom.get(INPUT_MUTATION_BARRIER_INPUTS)
+    mutation_indices = custom.get(INPUT_MUTATION_BARRIER_INDICES)
+    if mutation_inputs == frozenset() and not has_writeback:
+        return False
+    if mutation_indices and input_indices:
+        return not mutation_indices.isdisjoint(input_indices)
+
+    if barrier.target in (
+        torch.ops.streams.record_event.default,
+        torch.ops.streams.wait_stream.default,
+        torch.ops.streams.synchronize_stream.default,
+    ):
+        barrier_stream = barrier.args[
+            1 if barrier.target is torch.ops.streams.wait_stream.default else -1
+        ]
+        stream = get_current_stream(device) if stream is None else stream
+        if barrier_stream == stream:
+            return True
+        try:
+            barrier_value = get_external_object_by_index(barrier_stream)
+            stream_value = get_external_object_by_index(stream)
+        except (AssertionError, TypeError):
+            return True
+        if not isinstance(barrier_value, torch.Stream) or not isinstance(
+            stream_value, torch.Stream
+        ):
+            return True
+        return stream_identity(barrier_value) == stream_identity(stream_value)
+    if barrier.target is torch.ops.streams.synchronize_device.default:
+        return barrier.args == (device.type, device.index)
+    return False
+
+
+def assign_epilogue_copy_streams(
+    gm: torch.fx.GraphModule, fw_metadata: "ViewAndMutationMeta"
+) -> None:
+    epi_copies = list(
+        gm.graph.find_nodes(op="call_function", target=aten.copy_.default)
+    )
+    has_runtime_data_mutation = any(
+        fw_metadata.input_info[index].mutates_data
+        for index in fw_metadata.mutated_inp_runtime_indices
+    )
+    graph_nodes = list(gm.graph.nodes)
+    node_positions = {node: pos for pos, node in enumerate(graph_nodes)}
+    barriers = [
+        (pos, node)
+        for pos, node in enumerate(graph_nodes)
+        if node.op == "call_function" and node.target in _EPILOGUE_COPY_BARRIERS
+    ]
+
+    if has_runtime_data_mutation and barriers:
+        output_node = gm.graph.output_node()
+        output_args = pytree.tree_leaves(output_node.args[0])
+        output_descs = output_node.meta.get("desc", ())
+        mutations: dict[InputMutationAOTOutput, list[Node]] = {}
+        for output, desc in zip(output_args, output_descs):
+            while isinstance(desc, SubclassGetAttrAOTOutput):
+                desc = desc.base
+            if isinstance(desc, InputMutationAOTOutput) and isinstance(output, Node):
+                mutations.setdefault(desc, []).append(output)
+        for input_index, (desc, mutation_nodes) in zip(
+            fw_metadata.mutated_inp_runtime_indices, mutations.items(), strict=True
+        ):
+            if not fw_metadata.input_info[input_index].mutates_data:
+                continue
+            for mutation in mutation_nodes:
+                device = get_device(mutation)
+                if device.type == "cpu":
+                    continue
+                mutation_stream = get_stream(mutation)
+                if any(
+                    not is_bwd_node(barrier)
+                    and _barrier_may_order_stream(
+                        barrier,
+                        mutation_stream,
+                        device,
+                        desc.mutated_input.dynamo_input_indices,
+                    )
+                    for _, barrier in barriers
+                ):
+                    raise RuntimeError(
+                        "An out-of-graph input mutation cannot be ordered before a stream "
+                        "barrier inside the compiled region. Move the barrier after the "
+                        "compiled function call."
+                    )
+
+    for epi_copy in epi_copies:
+        copy_source = epi_copy.args[1]
+        arg_stream = get_stream(copy_source)
         copy_stream = get_stream(epi_copy)
         if arg_stream != copy_stream:
-            set_stream(epi_copy, get_stream_or_current_stream(epi_copy.args[1]))
+            set_stream(epi_copy, get_stream_or_current_stream(copy_source))
+
+        device = get_device(copy_source)
+        if not barriers or device.type == "cpu":
+            continue
+
+        # A barrier only covers work already submitted to the synchronized stream.
+        # Keep a functionalized mutation's write-back ahead of the first such barrier.
+        source_pos = node_positions[copy_source]
+        copy_pos = node_positions[epi_copy]
+        copy_is_backward = is_bwd_node(epi_copy)
+        input_desc = epi_copy.args[0].meta.get("desc")
+        candidate_barriers = []
+        for barrier_pos, barrier in barriers:
+            if barrier_pos >= copy_pos:
+                break
+            if is_bwd_node(barrier) != copy_is_backward:
+                continue
+            if not _barrier_may_order_stream(
+                barrier,
+                arg_stream,
+                device,
+                input_desc.dynamo_input_indices
+                if isinstance(input_desc, AOTInput)
+                else (),
+                has_writeback=source_pos < barrier_pos,
+            ):
+                continue
+            if barrier_pos <= source_pos:
+                raise RuntimeError(
+                    "A functionalized input mutation spans a stream barrier and "
+                    "cannot be safely written back inside the compiled region."
+                )
+            candidate_barriers.append(barrier)
+
+        if candidate_barriers:
+            if copy_is_backward:
+                raise RuntimeError(
+                    "A backward input mutation cannot be ordered before a stream "
+                    "barrier inside the compiled region. Move the barrier after the "
+                    "compiled backward call."
+                )
+            candidate_barriers[0].prepend(epi_copy)
+            for barrier in candidate_barriers:
+                barrier.meta.setdefault(_EPILOGUE_COPY_DEPS, []).append(epi_copy)
+
+    for _, barrier in barriers:
+        custom = barrier.meta.get("custom")
+        if custom is not None:
+            custom.pop(INPUT_MUTATION_BARRIER_INPUTS, None)
+            custom.pop(INPUT_MUTATION_BARRIER_INDICES, None)
+            if not custom:
+                barrier.meta.pop("custom")
 
 
 def populate_fw_metadata_with_stream_indices(
@@ -577,11 +741,9 @@ def _wrap_sync_node(
                 user.op == "call_function"
                 and user.target is torch.ops.aten.copy_.default
                 and user.args[0] is dep
-                and dep in partition_scoped_deps
             ):
-                # AOT functionalization leaves keep_input_mutations epilogue
-                # copy_ as the only writer of a partition-scoped placeholder.
-                # Preserve the destination identity used by mutation bookkeeping.
+                # AOT functionalization copy_ nodes must keep writing directly
+                # to their input placeholder, including across unrelated barriers.
                 user.args = (dep, *map_arg(user.args[1:], _replace))
             else:
                 user.args = map_arg(user.args, _replace)
@@ -773,6 +935,7 @@ def wrap_all_sync_nodes_with_control_deps(gm: torch.fx.GraphModule) -> None:
 
         if node.op == "call_function":
             if node.target in _SYNC_OPS:
+                epilogue_copy_deps = node.meta.get(_EPILOGUE_COPY_DEPS, ())
                 # synchronize_device and synchronize_stream block the CPU,
                 # so all subsequent kernel launches are host-ordered after
                 # them. Treat both as full barriers across all streams.
@@ -780,9 +943,12 @@ def wrap_all_sync_nodes_with_control_deps(gm: torch.fx.GraphModule) -> None:
                     torch.ops.streams.synchronize_device.default,
                     torch.ops.streams.synchronize_stream.default,
                 ):
-                    all_stream_deps = _collect_full_barrier_deps(
-                        stream_to_nodes, stream_sync_deps, bwd=is_bwd_node(node)
-                    )
+                    all_stream_deps = [
+                        *epilogue_copy_deps,
+                        *_collect_full_barrier_deps(
+                            stream_to_nodes, stream_sync_deps, bwd=is_bwd_node(node)
+                        ),
+                    ]
                     existing_deps = set(all_stream_deps)
                     for dep in full_barrier_forward_deps.get(node, ()):
                         if dep not in existing_deps:
@@ -815,7 +981,10 @@ def wrap_all_sync_nodes_with_control_deps(gm: torch.fx.GraphModule) -> None:
                 if node.target is torch.ops.streams.wait_stream.default:
                     waiting_stream: int = node.args[0]  # type: ignore[assignment]
                     waited_on_stream: int = node.args[1]  # type: ignore[assignment]
-                    deps_before_sync = list(stream_to_nodes.get(waited_on_stream, ()))
+                    deps_before_sync = [
+                        *epilogue_copy_deps,
+                        *stream_to_nodes.get(waited_on_stream, ()),
+                    ]
                     if waiting_stream != waited_on_stream:
                         deps_before_sync.extend(stream_to_nodes.get(waiting_stream, ()))
                     if None in stream_to_nodes and waited_on_stream is not None:
@@ -890,12 +1059,16 @@ def wrap_all_sync_nodes_with_control_deps(gm: torch.fx.GraphModule) -> None:
                         stream_to_nodes, stream_sync_deps, bwd=is_bwd_node(node)
                     )
                     deps_before_sync = [
+                        *epilogue_copy_deps,
                         *all_stream_deps,
                         *full_barrier_forward_deps.get(node, ()),
                     ]
                 else:
                     sync_stream = node.args[1]  # type: ignore[assignment]
-                    deps_before_sync = list(stream_to_nodes.get(sync_stream, ()))
+                    deps_before_sync = [
+                        *epilogue_copy_deps,
+                        *stream_to_nodes.get(sync_stream, ()),
+                    ]
                     partition_scoped_deps = (
                         list(stream_sync_forward_deps.get(node, ()))
                         if node.target is torch.ops.streams.wait_event.default

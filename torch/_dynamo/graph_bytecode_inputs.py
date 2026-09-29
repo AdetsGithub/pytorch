@@ -18,6 +18,8 @@ index_to_bytecode_constructor: list[Callable[[PyCodegen], None]] = []
 
 index_to_external_object_weakref: list[weakref.ReferenceType[object]] = []
 
+current_stream_device_to_index: dict[tuple[str, int | None], int] = {}
+
 keep_alive: list[object] = []
 
 
@@ -28,9 +30,6 @@ def has_user_objects() -> bool:
 def stash_graph_created_object(obj: object) -> object:
     keep_alive.append(obj)
     return obj
-
-
-CURRENT_STREAM_INDEX = 0
 
 
 def set_external_object_by_index(index: int, value: object) -> None:
@@ -58,10 +57,31 @@ def store_user_object_weakrefs(*args: object) -> None:
     index_to_external_object_weakref = list(map(weakref.ref, args))
 
 
+def store_current_stream_indices(
+    current_stream_indices: tuple[tuple[str, int | None, int], ...],
+) -> None:
+    current_stream_device_to_index.clear()
+    current_stream_device_to_index.update(
+        {
+            (device_type, device_index): index
+            for device_type, device_index, index in current_stream_indices
+        }
+    )
+
+
 def reset_user_object_tracking() -> None:
     index_to_bytecode_constructor.clear()
     index_to_external_object_weakref.clear()
+    current_stream_device_to_index.clear()
     keep_alive.clear()
+
+
+def register_current_stream(device: object, index: int) -> None:
+    current_stream_device_to_index[(device.type, device.index)] = index
+
+
+def get_current_stream_index(device: object) -> int | None:
+    return current_stream_device_to_index.get((device.type, device.index))
 
 
 def register_graph_created_object(

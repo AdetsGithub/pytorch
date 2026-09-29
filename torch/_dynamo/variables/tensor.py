@@ -474,7 +474,7 @@ class TensorVariable(VariableTracker):
             and version_after > version_before
         ):
             self.synchronize_attributes(tx)
-            tx.output.check_input_mutation_on_current_stream(tx)
+            tx.output.check_input_mutation_on_current_stream(tx, (self,))
 
     def debug_repr(self) -> str:
         return _tensor_debug_repr(

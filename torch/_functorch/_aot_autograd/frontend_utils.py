@@ -279,6 +279,7 @@ def _try_get_metadata_from_dynamo(
     seen_sources = set()
 
     aot_autograd_arg_pos_to_source: list[torch._guards.Source | None] = []
+    source_name_to_input_indices: dict[str, list[int]] = {}
     static_input_indices = []
     # Collect the new inputs lifted by aotdispatch
     for i, name in enumerate(param_keys):
@@ -291,6 +292,7 @@ def _try_get_metadata_from_dynamo(
             raise AssertionError(f"source must not be None for {name}")
         seen_sources.add(source)
         aot_autograd_arg_pos_to_source.append(source)
+        source_name_to_input_indices.setdefault(source.name, []).append(i)
 
         static_input_indices.append(i)
 
@@ -315,6 +317,13 @@ def _try_get_metadata_from_dynamo(
         # where extra_params are the params/buffers that dynamo baked into the
         # OutputGraph
         actual_pos = pos + len(param_keys)
+        identity_source = source
+        if identity_source is None and "grapharg" in node.meta:
+            identity_source = node.meta["grapharg"].source
+        if identity_source is not None:
+            source_name_to_input_indices.setdefault(identity_source.name, []).append(
+                actual_pos
+            )
 
         if "tensor_dict" in node.meta and node.meta["tensor_dict"].get(
             "_dynamo_static_input_type", None
@@ -332,6 +341,19 @@ def _try_get_metadata_from_dynamo(
         raise AssertionError(
             f"full_args_num={full_args_num} != len(aot_autograd_arg_pos_to_source)={len(aot_autograd_arg_pos_to_source)}"
         )
+    from torch._dynamo.variables.streams import (
+        INPUT_MUTATION_BARRIER_INDICES,
+        INPUT_MUTATION_BARRIER_INPUTS,
+    )
+
+    for node in mod.graph.nodes:
+        input_names = node.meta.get("custom", {}).get(INPUT_MUTATION_BARRIER_INPUTS)
+        if input_names is not None:
+            node.meta["custom"][INPUT_MUTATION_BARRIER_INDICES] = frozenset(
+                input_index
+                for input_name in input_names
+                for input_index in source_name_to_input_indices.get(input_name, ())
+            )
     return aot_autograd_arg_pos_to_source, static_input_indices
 
 

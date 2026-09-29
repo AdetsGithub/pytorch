@@ -34,6 +34,10 @@ from torch._dynamo.utils import (
     numpy_wrapper_cache_key,
     warn_once,
 )
+from torch._dynamo.variables.streams import (
+    INPUT_MUTATION_BARRIER_INDICES,
+    INPUT_MUTATION_BARRIER_INPUTS,
+)
 from torch._functorch import config
 from torch._inductor.codecache import (
     _ident,
@@ -611,6 +615,20 @@ class AOTAutogradCacheDetails(FxGraphHashDetails):
             if isinstance(module, torch.fx.GraphModule)
             for node_index, node in enumerate(module.graph.nodes)
             if (budget := _get_memory_budget_annotation(node)) is not None
+        )
+        self.input_mutation_barrier_annotations = tuple(
+            (
+                module_name,
+                node_index,
+                tuple(sorted(node.meta["custom"][INPUT_MUTATION_BARRIER_INPUTS])),
+                tuple(
+                    sorted(node.meta["custom"].get(INPUT_MUTATION_BARRIER_INDICES, ()))
+                ),
+            )
+            for module_name, module in gm.named_modules()
+            if isinstance(module, torch.fx.GraphModule)
+            for node_index, node in enumerate(module.graph.nodes)
+            if INPUT_MUTATION_BARRIER_INPUTS in node.meta.get("custom", {})
         )
 
         # Note: We use the live config module, not self.autograd_config (the

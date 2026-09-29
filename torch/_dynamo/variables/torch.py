@@ -86,6 +86,7 @@ from ..utils import (
     check_positional,
     check_unspec_or_constant_args,
     fqn,
+    get_fake_values_from_nodes,
     guard_if_dyn,
     has_torch_function,
     hashable,
@@ -2962,13 +2963,25 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
                 # Under compile-on-one-rank the index must stay None so the runtime
                 # resolves it per rank and one artifact serves them all.
                 if not _coor_enabled():
-                    device_index = 0
+                    current_device_source = CallFunctionNoArgsSource(
+                        AttrSource(
+                            AttrSource(ImportSource("torch"), "accelerator"),
+                            "current_device_index",
+                        )
+                    )
+                    install_guard(
+                        current_device_source.make_guard(GuardBuilder.EQUALS_MATCH)
+                    )
+                    device_index = torch.accelerator.current_device_index()
 
-            tx.output.create_proxy(
+            proxy = tx.output.create_proxy(
                 "call_function",
                 torch.ops.streams.synchronize_device,
                 (device.type, device_index),
                 {},
+            )
+            tx.output.mark_input_mutation_barrier(
+                proxy.node, device=torch.device(device.type, device_index)
             )
             return ConstantVariable.create(None)
 
@@ -3888,15 +3901,99 @@ For now, dynamo will explicitly graph break when it encounters user code with th
             if tx.fake_mode and tx.fake_mode.shape_env:
                 ctx = tx.fake_mode.shape_env.ignore_fresh_unbacked_symbols
 
+        from .tensor import TensorVariable
+
+        proxy_args, proxy_kwargs = proxy_args_kwargs(args, kwargs)
+        schema = fn_._schema if isinstance(fn_, torch._ops.OpOverload) else None
+        packet = fn_ if isinstance(fn_, torch._ops.OpOverloadPacket) else None
+        if packet is None:
+            name = getattr(fn_, "__name__", None)
+            packet = (
+                getattr(torch.ops.aten, name, None)
+                if (
+                    name
+                    and getattr(fn_, "__module__", None) == "torch"
+                    and (name.endswith("_") or "out" in kwargs)
+                )
+                else None
+            )
+            if not isinstance(packet, torch._ops.OpOverloadPacket):
+                packet = None
+        if packet is not None:
+            node_args_kwargs = _pytree.tree_map_only(
+                torch.fx.Proxy,
+                lambda proxy: proxy.node,
+                (proxy_args, proxy_kwargs),
+            )
+            fake_args, fake_kwargs = get_fake_values_from_nodes(
+                tx, node_args_kwargs, False
+            )
+            try:
+                overload = torch._C._jit_resolve_packet(
+                    packet._qualified_op_name, *fake_args, **fake_kwargs
+                )
+                resolved_op = getattr(packet, overload)
+                schema = resolved_op._schema
+                if isinstance(fn_, torch._ops.OpOverloadPacket):
+                    fn_ = resolved_op
+            except RuntimeError:
+                pass
+
+        tensor_arg_versions: list[tuple[TensorVariable, int]] = []
+        tensor_arg_ids: set[int] = set()
+
+        def record_tensor_arg_version(var: VariableTracker) -> None:
+            if isinstance(var, TensorVariable) and id(var) not in tensor_arg_ids:
+                value = var.as_proxy().node.meta.get("example_value")
+                if isinstance(value, torch.Tensor):
+                    tensor_arg_versions.append((var, value._version))
+                    tensor_arg_ids.add(id(var))
+
+        if schema is None:
+            VariableTracker.visit(record_tensor_arg_version, (args, kwargs))
+
         with ctx():
             tensor_variable = wrap_fx_proxy(
                 tx=tx,
                 proxy=tx.output.create_proxy(
                     "call_function",
                     fn_,
-                    *proxy_args_kwargs(args, kwargs),
+                    proxy_args,
+                    proxy_kwargs,
                 ),
             )
+
+        mutated_tensors: list[TensorVariable]
+        if schema is None:
+            mutated_tensors = [
+                var
+                for var, version in tensor_arg_versions
+                if var.as_proxy().node.meta["example_value"]._version > version
+            ]
+        else:
+            mutated_tensors = []
+            mutated_args = []
+            if schema.is_mutable:
+                for index, argument in enumerate(schema.arguments):
+                    if argument.alias_info is None or not argument.alias_info.is_write:
+                        continue
+                    if argument.name in kwargs:
+                        mutated_args.append(kwargs[argument.name])
+                    elif not argument.kwarg_only and index < len(args):
+                        mutated_args.append(args[index])
+            mutated_tensor_ids: set[int] = set()
+
+            def collect_mutated_tensor(var: VariableTracker) -> None:
+                if (
+                    isinstance(var, TensorVariable)
+                    and id(var) not in mutated_tensor_ids
+                ):
+                    mutated_tensors.append(var)
+                    mutated_tensor_ids.add(id(var))
+
+            VariableTracker.visit(collect_mutated_tensor, mutated_args)
+        if mutated_tensors:
+            tx.output.check_input_mutation_on_current_stream(tx, mutated_tensors)
 
         # Handle e.g., `torch.ones(10, requires_grad=True)`
         if (

@@ -1129,7 +1129,9 @@ def create_functionalized_fn(
 
                     with (
                         torch.fx.traceback.preserve_node_meta(),
-                        set_partitioner_tag_must_be_in_backward(),
+                        set_partitioner_tag_must_be_in_backward()
+                        if trace_joint
+                        else nullcontext(),
                     ):
                         apply_in_graph_mutations(
                             meta.input_info[idx],

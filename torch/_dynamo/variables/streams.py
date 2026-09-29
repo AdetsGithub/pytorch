@@ -11,8 +11,8 @@ from .. import graph_break_hints
 from ..bytecode_transformation import create_call_function
 from ..exc import TYPE_CHECKING, unimplemented
 from ..graph_bytecode_inputs import (
-    CURRENT_STREAM_INDEX,
     get_external_object_by_index,
+    register_current_stream,
     register_graph_created_object,
     register_user_object,
     reset_user_object_tracking,
@@ -33,6 +33,14 @@ from torch._library.custom_ops import custom_op
 
 
 Tensor = torch.Tensor
+StreamIdentity = tuple[str, int | None, int]
+INPUT_MUTATION_BARRIER_INPUTS = "input_mutation_barrier_inputs"
+INPUT_MUTATION_BARRIER_INDICES = "input_mutation_barrier_indices"
+
+
+def stream_identity(stream: torch.Stream) -> StreamIdentity:
+    device = stream.device
+    return device.type, device.index, stream.native_handle
 
 
 def new_event(*args: Any, **kwargs: Any) -> int:
@@ -271,39 +279,36 @@ class SymbolicStreamState:
     """Track the currently entered stream if any"""
 
     def __init__(self) -> None:
-        from ..source import CurrentStreamSource
-
         cur_stack: list[StreamVariable] = []
+        self.current_streams: dict[torch.device, StreamVariable] = {}
         if torch.accelerator.is_available():
-            from torch.fx.experimental.proxy_tensor import _coor_device_index_is_current
-
-            # Reset the registry so the current stream is guaranteed index 0.
             reset_user_object_tracking()
-            stream = torch.accelerator.current_stream()
-            device = stream.device
-            if _coor_device_index_is_current(device):
-                # Reconstruct the stream relative to each rank's current device.
-                device = torch.device(device.type)
-            source = CurrentStreamSource(device)
-            # Register the current stream so it gets index 0 (registry is
-            # fresh at tracing start).  The inductor wrapper updates this
-            # entry at runtime so cudagraph capture uses the capture stream
-            # instead of this stale trace-time stream.
-            index = register_user_object(stream, source)
-            if index != CURRENT_STREAM_INDEX:
-                raise AssertionError(
-                    f"Current stream must be registered at index {CURRENT_STREAM_INDEX}, "
-                    f"got {index}"
-                )
-            stream_var = LazyVariableTracker.create(stream, source=source)
-            # Set user_object_index as an instance attribute so accessing it
-            # does NOT trigger LazyVariableTracker realization.
-            stream_var.user_object_index = index  # type: ignore[union-attr]
-            cur_stack = [stream_var]  # type: ignore[list-item]
+            stream_var = self._register_current_stream(
+                torch.accelerator.current_stream()
+            )
+            if stream_var.user_object_index != 0:
+                raise AssertionError("Current stream must be registered at index 0")
+            cur_stack = [stream_var]
 
         self.cur_stream_stack: collections.deque[StreamVariable] = collections.deque(
             cur_stack
         )
+
+    def _register_current_stream(self, stream: torch.Stream) -> "StreamVariable":
+        from torch.fx.experimental.proxy_tensor import _coor_device_index_is_current
+
+        codegen_device = stream.device
+        if _coor_device_index_is_current(codegen_device):
+            codegen_device = torch.device(codegen_device.type)
+        codegen_source = CurrentStreamSource(codegen_device)
+        index = register_user_object(stream, codegen_source)
+        register_current_stream(stream.device, index)
+        source = CurrentStreamSource(codegen_device, user_object_index=index)
+        stream_var = LazyVariableTracker.create(stream, source=source)
+        # Avoid realizing the lazy variable when stream ops need its registry index.
+        stream_var.user_object_index = index  # type: ignore[union-attr]
+        self.current_streams[stream.device] = stream_var  # type: ignore[assignment]
+        return stream_var  # type: ignore[return-value]
 
     def enter_stream(self, stream: "StreamVariable") -> None:
         self.cur_stream_stack.append(stream)
@@ -317,17 +322,12 @@ class SymbolicStreamState:
                 if stream.device == device:
                     return stream
 
+            current = torch.accelerator.current_stream(device)
+            if current.device not in self.current_streams:
+                return self._register_current_stream(current)
+            return self.current_streams[current.device]
+
         return self.cur_stream_stack[-1]
-
-    def in_stream_context(self) -> bool:
-        return len(self.cur_stream_stack) > 0
-
-    def cur_stream_id(self) -> int:
-        """Get a Python object id for the current stream without realizing lazy variables."""
-        stream = self.cur_stream_stack[-1]
-        if isinstance(stream, LazyVariableTracker) and not stream.is_realized():
-            return id(stream.peek_value())
-        return id(stream.value)
 
 
 class StreamContextVariable(FxTracebackAnnotateVariable):
@@ -460,12 +460,13 @@ class StreamVariable(StreamContextVariable):
         other_stream = args[0]
         if not isinstance(other_stream, StreamVariable):
             raise AssertionError(f"Expected StreamVariable, got {type(other_stream)}")
-        tx.output.create_proxy(
+        proxy = tx.output.create_proxy(
             "call_function",
             torch.ops.streams.wait_stream,
             (self.user_object_index, other_stream.user_object_index),
             {},
         )
+        tx.output.mark_input_mutation_barrier(proxy.node, (other_stream,))
         return ConstantVariable.create(None)
 
     def synchronize(
@@ -474,12 +475,13 @@ class StreamVariable(StreamContextVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
-        tx.output.create_proxy(
+        proxy = tx.output.create_proxy(
             "call_function",
             torch.ops.streams.synchronize_stream,
             (self.user_object_index,),
             {},
         )
+        tx.output.mark_input_mutation_barrier(proxy.node, (self,))
         return ConstantVariable.create(None)
 
     def query(
@@ -507,7 +509,8 @@ class StreamVariable(StreamContextVariable):
     ) -> VariableTracker:
         from .builder import wrap_fx_proxy
 
-        tx.output.check_event_record_after_input_mutation(id(self.value))
+        input_mutations = tx.output.input_mutation_barrier_inputs((self,))
+        tx.output.check_event_record_after_input_mutation(input_mutations)
         if args and isinstance(args[0], EventVariable):
             event_var = args[0]
             event = event_var.value
@@ -520,11 +523,14 @@ class StreamVariable(StreamContextVariable):
                     TupleVariable([]), ConstDictVariable({})
                 ),
             )
-        tx.output.create_proxy(
+        proxy = tx.output.create_proxy(
             "call_function",
             torch.ops.streams.record_event,
             (event_index, self.user_object_index),
             {},
+        )
+        tx.output.mark_input_mutation_barrier(
+            proxy.node, (self,), mutation_inputs=input_mutations
         )
         return wrap_fx_proxy(
             tx=tx,
@@ -709,8 +715,9 @@ class EventVariable(VariableTracker):
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
         stream_arg, stream_index = EventVariable._get_stream_arg(tx, args, kwargs)
-        tx.output.check_event_record_after_input_mutation(id(stream_arg.value))
-        tx.output.create_proxy(
+        input_mutations = tx.output.input_mutation_barrier_inputs((stream_arg,))
+        tx.output.check_event_record_after_input_mutation(input_mutations)
+        proxy = tx.output.create_proxy(
             "call_function",
             torch.ops.streams.record_event,
             (
@@ -718,6 +725,9 @@ class EventVariable(VariableTracker):
                 stream_index,
             ),
             {},
+        )
+        tx.output.mark_input_mutation_barrier(
+            proxy.node, (stream_arg,), mutation_inputs=input_mutations
         )
         return ConstantVariable.create(None)
 

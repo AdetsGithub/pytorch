@@ -57,6 +57,12 @@ def store_user_object_weakrefs(*args: object) -> None:
     index_to_external_object_weakref = list(map(weakref.ref, args))
 
 
+def snapshot_current_stream_indices() -> tuple[tuple[str, int | None, int], ...]:
+    return tuple(
+        (*device, index) for device, index in current_stream_device_to_index.items()
+    )
+
+
 def store_current_stream_indices(
     current_stream_indices: tuple[tuple[str, int | None, int], ...],
 ) -> None:
@@ -81,7 +87,10 @@ def register_current_stream(device: object, index: int) -> None:
 
 
 def get_current_stream_index(device: object) -> int | None:
-    return current_stream_device_to_index.get((device.type, device.index))
+    index = current_stream_device_to_index.get((device.type, device.index))
+    if index is None and device.index is not None:
+        index = current_stream_device_to_index.get((device.type, None))
+    return index
 
 
 def register_graph_created_object(

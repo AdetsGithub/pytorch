@@ -3360,6 +3360,31 @@ class TestStreamsCUDASpecific(torch._dynamo.test_case.TestCase):
             ):
                 torch.compile(fn, backend="aot_eager", fullgraph=True)(x, y)
 
+    @unittest.skipIf(not TEST_MULTIGPU, "requires multiple CUDA devices")
+    @torch.compiler.config.patch(compile_on_one_rank=True)
+    def test_coor_reused_graph_tracks_current_stream_on_another_device(self) -> None:
+        from torch._dynamo.utils import counters
+
+        torch._dynamo.reset()
+        counters.clear()
+
+        def fn(x, event):
+            event.record(torch.cuda.current_stream())
+            return x + 1
+
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        for index in (0, 1):
+            with torch.cuda.device(index):
+                x = torch.zeros(8, device="cuda")
+                event = torch.cuda.Event()
+                self.assertEqual(compiled(x, event), torch.ones_like(x))
+                self.assertEqual(compiled(x, event), torch.ones_like(x))
+                current_index = get_current_stream_index(x.device)
+                self.assertIsNotNone(current_index)
+                self.assertEqual(event.device, x.device)
+
+        self.assertEqual(counters["stats"]["unique_graphs"], 1)
+
     def test_deduplicated_input_writeback_precedes_wait_stream(self) -> None:
         stream = torch.cuda.Stream()
 

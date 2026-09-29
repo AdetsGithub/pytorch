@@ -116,9 +116,9 @@ from .exc import (
     unimplemented_with_warning,
 )
 from .graph_bytecode_inputs import (
-    current_stream_device_to_index,
     has_user_objects,
     index_to_bytecode_constructor,
+    snapshot_current_stream_indices,
 )
 from .graph_deduplication import apply_graph_deduplication
 from .graph_id_filter import (
@@ -1446,12 +1446,20 @@ class OutputGraph(OutputGraphCommon):
         else:
             if device is None:
                 raise AssertionError("A barrier must specify streams or a device")
+            from torch.fx.experimental.proxy_tensor import _coor_device_index_is_current
+
             matching_streams = {
                 identity
                 for input_mutations in self._input_mutation_streams.values()
                 for identity in input_mutations
                 if identity[0] == device.type
-                and (device.index is None or identity[1] == device.index)
+                and (
+                    identity[1] == device.index
+                    or (
+                        device.index is None
+                        and _coor_device_index_is_current(torch.device(*identity[:2]))
+                    )
+                )
             }
 
         return {
@@ -3320,10 +3328,7 @@ class OutputGraph(OutputGraphCommon):
                         "store_current_stream_indices",
                     )
                 )
-                current_stream_indices = tuple(
-                    (*device, index)
-                    for device, index in current_stream_device_to_index.items()
-                )
+                current_stream_indices = snapshot_current_stream_indices()
                 cg.append_output(cg.create_load_const(current_stream_indices))
                 cg.call_function(1, False)
                 cg.pop_top()

@@ -9,6 +9,7 @@ This module defines runtime wrappers, which, based on previous analysis attempts
 import collections
 import contextlib
 import copy
+import dataclasses
 import functools
 import itertools
 import pprint
@@ -27,9 +28,9 @@ from torch._custom_class_base import CustomClassBase
 from torch._dynamo import config as dynamo_config
 from torch._dynamo.callback import callback_handler, CallbackTrigger
 from torch._dynamo.graph_bytecode_inputs import (
-    current_stream_device_to_index,
     index_to_external_object_weakref,
     set_external_object_by_index,
+    snapshot_current_stream_indices,
     store_current_stream_indices,
 )
 from torch._dynamo.utils import (
@@ -124,14 +125,13 @@ def _snapshot_external_objects(ctx: Any) -> None:
         for k, ref in enumerate(index_to_external_object_weakref)
         if ref() is not None
     }
-    for (device_type, device_index), index in current_stream_device_to_index.items():
+    current_stream_indices = snapshot_current_stream_indices()
+    for device_type, device_index, index in current_stream_indices:
         if index not in ctx._external_objects:
             ctx._external_objects[index] = torch.accelerator.current_stream(
                 torch.device(device_type, device_index)
             )
-    ctx._external_stream_indices = tuple(
-        (*device, index) for device, index in current_stream_device_to_index.items()
-    )
+    ctx._external_stream_indices = current_stream_indices
 
 
 def _unwrap_tensor_subclasses_no_symints(
@@ -1740,7 +1740,7 @@ class AOTDedupeWrapper(CompilerWrapper):
         for desc, deduped_index in zip(flat_args_descs, add_dupe_map):
             deduped_input_indices[deduped_index].update(desc.dynamo_input_indices)
         deduped_flat_args_descs = [
-            desc.with_dynamo_inputs(indices=tuple(sorted(indices)))
+            dataclasses.replace(desc, dynamo_input_indices=tuple(sorted(indices)))
             for desc, indices in zip(
                 deduped_flat_args_descs,
                 deduped_input_indices,

@@ -14,6 +14,7 @@ from torch._dynamo.variables.streams import (
     new_event,
     stream_identity,
 )
+from torch.fx.experimental.proxy_tensor import _coor_device_index_is_current
 from torch.fx.node import map_arg
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._runtime_estimation import (
@@ -384,7 +385,8 @@ def _barrier_may_order_stream(
     if barrier.target is torch.ops.streams.synchronize_device.default:
         barrier_type, barrier_index = barrier.args
         return barrier_type == device.type and (
-            barrier_index is None or barrier_index == device.index
+            barrier_index == device.index
+            or (barrier_index is None and _coor_device_index_is_current(device))
         )
     return False
 

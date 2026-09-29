@@ -302,7 +302,7 @@ class SymbolicStreamState:
             codegen_device = torch.device(codegen_device.type)
         codegen_source = CurrentStreamSource(codegen_device)
         index = register_user_object(stream, codegen_source)
-        register_current_stream(stream.device, index)
+        register_current_stream(codegen_device, index)
         stream_var = LazyVariableTracker.create(stream, source=codegen_source)
         # Avoid realizing the lazy variable when stream ops need its registry index.
         stream_var.user_object_index = index  # type: ignore[union-attr]

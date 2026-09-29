@@ -336,12 +336,6 @@ class AOTInput:
         default=(), kw_only=True, compare=False, repr=False
     )
 
-    def with_dynamo_inputs(self, *, indices: tuple[int, ...]) -> "AOTInput":
-        return dataclasses.replace(
-            self,
-            dynamo_input_indices=indices,
-        )
-
     def expr(self) -> str:
         raise NotImplementedError("Subclasses must implement expr()")
 

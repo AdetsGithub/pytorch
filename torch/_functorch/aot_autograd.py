@@ -504,7 +504,7 @@ def create_aot_state(
     """
 
     flat_args_descs = [
-        desc.with_dynamo_inputs(indices=(index,))
+        dataclasses.replace(desc, dynamo_input_indices=(index,))
         for index, desc in enumerate(flat_args_descs)
     ]
 

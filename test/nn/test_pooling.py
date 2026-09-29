@@ -29,6 +29,7 @@ from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests,
     largeTensorTest,
     onlyAccelerator,
+    onlyOn,
     skipMPS,
     TEST_WITH_ROCM,
 )
@@ -840,6 +841,97 @@ class TestPoolingNNDevice(NNTestCase):
         indices = torch.ones(1, 2, 3, 3, dtype=torch.long, device=device)
         with self.assertRaisesRegex(RuntimeError, "expected dimensions"):
             torch.ops.aten.adaptive_max_pool3d_backward(grad_output, input, indices)
+
+    @onlyOn(["cpu", "cuda"])
+    @parametrize_test(
+        "op_name,input_shape,kernel_size,output_size,memory_format",
+        [
+            subtest(
+                (
+                    "adaptive_max_pool3d",
+                    (2, 3, 6, 7, 8),
+                    None,
+                    (3, 3, 4),
+                    torch.channels_last_3d,
+                ),
+                name="adaptive_max_pool3d",
+            ),
+            subtest(
+                (
+                    "adaptive_max_pool3d",
+                    (3, 6, 6, 8),
+                    None,
+                    (3, 3, 4),
+                    None,
+                ),
+                name="adaptive_max_pool3d_unbatched",
+            ),
+            subtest(
+                (
+                    "fractional_max_pool2d",
+                    (2, 3, 7, 8),
+                    (2, 2),
+                    (3, 4),
+                    torch.channels_last,
+                ),
+                name="fractional_max_pool2d",
+            ),
+            subtest(
+                (
+                    "fractional_max_pool3d",
+                    (2, 3, 6, 7, 8),
+                    (2, 2, 2),
+                    (3, 3, 4),
+                    torch.channels_last_3d,
+                ),
+                name="fractional_max_pool3d",
+            ),
+        ],
+    )
+    def test_max_pool_backward_noncontiguous_indices(
+        self,
+        device,
+        op_name,
+        input_shape,
+        kernel_size,
+        output_size,
+        memory_format,
+    ):
+        input = torch.empty(input_shape, device=device)
+        spatial_dims = len(output_size)
+        output_shape = input_shape[:-spatial_dims] + output_size
+        output_numel = math.prod(output_shape)
+        input_plane_numel = math.prod(input_shape[-spatial_dims:])
+        indices = torch.arange(output_numel, device=device).reshape(output_shape)
+        indices = indices.remainder(input_plane_numel)
+        grad_output = torch.arange(
+            1, output_numel + 1, dtype=input.dtype, device=device
+        ).reshape(output_shape)
+        backward = getattr(torch.ops.aten, f"{op_name}_backward")
+        args = (grad_output, input)
+        if kernel_size is not None:
+            args += (kernel_size, output_size)
+        expected = backward(*args, indices)
+
+        if memory_format is None:
+            noncontiguous = indices.transpose(-2, -1).contiguous().transpose(-2, -1)
+        else:
+            noncontiguous = indices.contiguous(memory_format=memory_format)
+        self.assertFalse(noncontiguous.is_contiguous())
+        self.assertEqual(noncontiguous, indices)
+
+        grad_output.requires_grad_()
+        grad_input = backward(*args, noncontiguous)
+        self.assertEqual(grad_input, expected)
+        grad_grad_input = torch.arange(
+            1, input.numel() + 1, dtype=input.dtype, device=device
+        ).reshape(input_shape)
+        actual = torch.autograd.grad(grad_input, grad_output, grad_grad_input)[0]
+
+        expected = grad_grad_input.flatten(-spatial_dims).gather(
+            -1, noncontiguous.flatten(-spatial_dims)
+        )
+        self.assertEqual(actual, expected.reshape(output_shape))
 
     @expectedFailureMPS  # Op not implemented
     def test_FractionalMaxPool2d_zero_batch(self, device):

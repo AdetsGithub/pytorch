@@ -373,8 +373,9 @@ TORCH_IMPL_FUNC(fractional_max_pool2d_backward_cpu) (
   auto inputH = input.size(heightDim);
   auto inputW = input.size(widthDim);
 
-  /* get contiguous gradOutput */
+  /* get contiguous gradOutput and indices */
   auto gradOutput = gradOutput_.contiguous();
+  auto indices_ = indices.contiguous();
 
   /* backprop */
   AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -383,7 +384,7 @@ TORCH_IMPL_FUNC(fractional_max_pool2d_backward_cpu) (
     input.scalar_type(), "fractional_max_pool2d_backward_out_frame", [&] {
       auto gradInput_data = gradInput.data_ptr<scalar_t>();
       auto gradOutput_data = gradOutput.const_data_ptr<scalar_t>();
-      auto indices_data = indices.const_data_ptr<int64_t>();
+      auto indices_data = indices_.const_data_ptr<int64_t>();
       fractional_max_pool2d_backward_out_frame<scalar_t>(
         gradInput_data,
         gradOutput_data,

@@ -401,6 +401,7 @@ TORCH_IMPL_FUNC(adaptive_max_pool3d_backward_out_cuda)
   }
 
   const Tensor gradOutput_ = gradOutput.contiguous();
+  const Tensor indices_ = indices.contiguous();
 
   gradInput.zero_();
 
@@ -447,7 +448,7 @@ TORCH_IMPL_FUNC(adaptive_max_pool3d_backward_out_cuda)
         [&] {
           scalar_t* gradInput_data = gradInput.mutable_data_ptr<scalar_t>();
           const scalar_t* gradOutput_data = gradOutput_.const_data_ptr<scalar_t>();
-          const int64_t* indices_data = indices.const_data_ptr<int64_t>();
+          const int64_t* indices_data = indices_.const_data_ptr<int64_t>();
 
           atomicadaptivemaxgradinput_loop(
               gradInput_data,
@@ -470,7 +471,7 @@ TORCH_IMPL_FUNC(adaptive_max_pool3d_backward_out_cuda)
         [&] {
           scalar_t* gradInput_data = gradInput.mutable_data_ptr<scalar_t>();
           const scalar_t* gradOutput_data = gradOutput_.const_data_ptr<scalar_t>();
-          const int64_t* indices_data = indices.const_data_ptr<int64_t>();
+          const int64_t* indices_data = indices_.const_data_ptr<int64_t>();
 
           adaptivemaxgradinput_loop(
               gradInput_data,

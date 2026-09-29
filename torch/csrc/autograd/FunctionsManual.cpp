@@ -2531,19 +2531,9 @@ Tensor max_pool_double_backward(
     const Tensor& indices,
     int dim) {
   AT_ASSERT(indices.dim() >= dim);
-  // handle non-empty inputs
-  if (indices.sym_numel() != 0) {
-    auto size = indices.sym_sizes().slice(0, indices.dim() - dim).vec();
-    size.emplace_back(-1);
-    auto indices_view = indices.view_symint(size);
-    return grad.reshape_symint(size)
-        .gather(-1, indices_view)
-        .view_symint(indices.sym_sizes());
-  }
-  // handle empty inputs
-  else {
-    return at::empty_like(indices, grad.options());
-  }
+  return grad.flatten(-dim)
+      .gather(-1, indices.flatten(-dim))
+      .view_symint(indices.sym_sizes());
 }
 
 Tensor error_for_max_pool2d_double_backward() { // This is mps-only.

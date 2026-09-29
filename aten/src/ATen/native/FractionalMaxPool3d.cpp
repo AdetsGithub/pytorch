@@ -364,8 +364,9 @@ void fractional_max_pool3d_backward_out_cpu_template(
   TORCH_CHECK(outputW == gradOutput_.size(widthDim),
            "fractional_max_pool3d_backward_out(): gradOutput width unexpected");
 
-  /* get contiguous gradOutput */
+  /* get contiguous gradOutput and indices */
   auto gradOutput = gradOutput_.contiguous();
+  auto indices_ = indices.contiguous();
 
   /* resize */
   gradInput.resize_as_(input);
@@ -381,7 +382,7 @@ void fractional_max_pool3d_backward_out_cpu_template(
       fractional_max_pool3d_backward_out_frame<scalar_t>(
         gradInput.data_ptr<scalar_t>(),
         gradOutput.const_data_ptr<scalar_t>(),
-        indices.const_data_ptr<int64_t>(),
+        indices_.const_data_ptr<int64_t>(),
         numBatch, numPlanes,
         inputT, inputH, inputW,
         outputT, outputH, outputW

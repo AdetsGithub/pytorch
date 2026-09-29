@@ -1369,9 +1369,6 @@ class ShapeEnvSource(Source):
 @dataclass_with_cached_hash(frozen=True)
 class CurrentStreamSource(Source):
     device: device_type
-    user_object_index: int | None = dataclasses.field(
-        default=None, compare=False, repr=False
-    )
 
     @functools.cached_property
     def _name_template(self) -> str:

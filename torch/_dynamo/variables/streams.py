@@ -303,8 +303,7 @@ class SymbolicStreamState:
         codegen_source = CurrentStreamSource(codegen_device)
         index = register_user_object(stream, codegen_source)
         register_current_stream(stream.device, index)
-        source = CurrentStreamSource(codegen_device, user_object_index=index)
-        stream_var = LazyVariableTracker.create(stream, source=source)
+        stream_var = LazyVariableTracker.create(stream, source=codegen_source)
         # Avoid realizing the lazy variable when stream ops need its registry index.
         stream_var.user_object_index = index  # type: ignore[union-attr]
         self.current_streams[stream.device] = stream_var  # type: ignore[assignment]

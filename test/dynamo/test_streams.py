@@ -3294,6 +3294,72 @@ class TestStreamsCUDASpecific(torch._dynamo.test_case.TestCase):
                 compiled(x)
         self.assertEqual(synchronize.call_args.args, (torch.device("cuda"),))
 
+    @parametrize("explicit_device", (False, True))
+    @parametrize("hidden_data_mutation", (False, True))
+    @torch.compiler.config.patch(compile_on_one_rank=True)
+    def test_indexless_device_sync_orders_input_writeback(
+        self, explicit_device, hidden_data_mutation
+    ) -> None:
+        from torch._inductor.utils import run_and_get_code
+        from torch.testing import FileCheck
+
+        @torch.compiler.allow_in_graph
+        def mutate_data(x):
+            x.data.add_(1)
+            return x
+
+        with torch.cuda.device(0):
+            stream = torch.cuda.Stream()
+
+            def fn(x, y):
+                with stream:
+                    if hidden_data_mutation:
+                        mutate_data(x)
+                    else:
+                        x.add_(1)
+                if explicit_device:
+                    torch.cuda.synchronize(torch.device("cuda"))
+                else:
+                    torch.cuda.synchronize()
+                return y + 1
+
+            x = torch.zeros(1024, device="cuda")
+            y = torch.zeros(1, device="cuda")
+            compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+            result, (code,) = run_and_get_code(compiled, x, y)
+            observed = x.clone()
+            torch.cuda.synchronize()
+
+        self.assertEqual(result, y + 1)
+        self.assertEqual(observed, torch.ones_like(x))
+        FileCheck().check("def call(").check("aten.copy_]").check(
+            "torch.ops.streams.synchronize_device.default('cuda', None)"
+        ).run(code)
+
+    @parametrize("explicit_device", (False, True))
+    @torch.compiler.config.patch(compile_on_one_rank=True)
+    def test_indexless_device_sync_rejects_external_writeback(
+        self, explicit_device
+    ) -> None:
+        with torch.cuda.device(0):
+            stream = torch.cuda.Stream()
+
+            def fn(x, y):
+                with stream:
+                    x.add_(1)
+                if explicit_device:
+                    torch.cuda.synchronize(torch.device("cuda"))
+                else:
+                    torch.cuda.synchronize()
+                return y + 1
+
+            x = torch.zeros(8, device="cuda", requires_grad=True) + 0
+            y = torch.zeros(1, device="cuda")
+            with self.assertRaisesRegex(
+                RuntimeError, "out-of-graph input mutation cannot be ordered"
+            ):
+                torch.compile(fn, backend="aot_eager", fullgraph=True)(x, y)
+
     def test_deduplicated_input_writeback_precedes_wait_stream(self) -> None:
         stream = torch.cuda.Stream()
 

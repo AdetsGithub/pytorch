@@ -1450,7 +1450,8 @@ class OutputGraph(OutputGraphCommon):
                 identity
                 for input_mutations in self._input_mutation_streams.values()
                 for identity in input_mutations
-                if identity[:2] == (device.type, device.index)
+                if identity[0] == device.type
+                and (device.index is None or identity[1] == device.index)
             }
 
         return {

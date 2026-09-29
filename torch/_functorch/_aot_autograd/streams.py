@@ -382,7 +382,10 @@ def _barrier_may_order_stream(
             return True
         return stream_identity(barrier_value) == stream_identity(stream_value)
     if barrier.target is torch.ops.streams.synchronize_device.default:
-        return barrier.args == (device.type, device.index)
+        barrier_type, barrier_index = barrier.args
+        return barrier_type == device.type and (
+            barrier_index is None or barrier_index == device.index
+        )
     return False
 
 

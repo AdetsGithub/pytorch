@@ -120,6 +120,7 @@ if typing.TYPE_CHECKING:
 
 def _snapshot_external_objects(ctx: Any) -> None:
     """Snapshot the external object registry onto ctx for backward restore."""
+    ctx._external_object_weakrefs = tuple(index_to_external_object_weakref)
     ctx._external_objects = {
         k: ref()
         for k, ref in enumerate(index_to_external_object_weakref)
@@ -3665,6 +3666,8 @@ class _AOTDispatchAutogradFunctionFactory:
                         ),
                     )
 
+                if hasattr(ctx, "_external_object_weakrefs"):
+                    index_to_external_object_weakref[:] = ctx._external_object_weakrefs
                 for idx, obj in getattr(ctx, "_external_objects", {}).items():
                     set_external_object_by_index(idx, obj)
                 if hasattr(ctx, "_external_stream_indices"):

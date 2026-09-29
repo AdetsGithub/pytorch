@@ -3730,6 +3730,34 @@ class TestStreamsCUDASpecific(torch._dynamo.test_case.TestCase):
             self.assertEqual(get_current_stream_index(x.device), first_stream_index)
             self.assertEqual(x.grad, x.cos())
 
+    def test_interleaved_backward_restores_runtime_stream(self) -> None:
+        def first(x):
+            current = torch.cuda.current_stream()
+            current.wait_stream(current)
+            return x.sin()
+
+        def second(x):
+            with torch.cuda.stream(torch.cuda.current_stream()):
+                return x.cos()
+
+        compiled_first = torch.compile(first, backend="aot_eager", fullgraph=True)
+        compiled_second = torch.compile(second, backend="aot_eager", fullgraph=True)
+        compiled_first(torch.ones(8, device="cuda", requires_grad=True))
+
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            x = torch.ones(8, device="cuda", requires_grad=True)
+            output = compiled_first(x)
+            stream_index = get_current_stream_index(x.device)
+            self.assertIsNotNone(stream_index)
+
+        compiled_second(torch.ones(8, device="cuda", requires_grad=True))
+        output.sum().backward()
+
+        restored = graph_bytecode_inputs.get_external_object_by_index(stream_index)
+        self.assertEqual(restored.native_handle, stream.native_handle)
+        self.assertEqual(x.grad, x.cos())
+
     @unittest.skipIf(not TEST_MULTIGPU, "requires multiple CUDA devices")
     def test_backward_implicit_stream_uses_input_device(self) -> None:
         observer = torch.cuda.Stream(device=1)

@@ -53,8 +53,7 @@ def get_external_object_by_index(index: int) -> object:
 
 
 def store_user_object_weakrefs(*args: object) -> None:
-    global index_to_external_object_weakref
-    index_to_external_object_weakref = list(map(weakref.ref, args))
+    index_to_external_object_weakref[:] = map(weakref.ref, args)
 
 
 def snapshot_current_stream_indices() -> tuple[tuple[str, int | None, int], ...]:

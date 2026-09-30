@@ -7322,6 +7322,18 @@ class Scheduler:
         if atomic_add_template_epilogue and not config.epilogue_fusion_with_atomic_add:
             return FusionResult.fuse(False)
 
+        # A reduction in a Triton template's epilogue is kept only when the
+        # epilogue benchmark shows it beats the template plus a separate
+        # reduction kernel.
+        template_reduction = isinstance(
+            node1.get_template_node(), ir.TritonTemplateBuffer
+        ) and any(n.is_reduction() for n in node2.get_nodes())
+        if template_reduction and not (
+            isinstance(node1.get_template_node(), ir.MultiTemplateBuffer)
+            and config.benchmark_epilogue_fusion
+        ):
+            return FusionResult.fuse(False)
+
         if not config.benchmark_fusion and not is_multi_template:
             return FusionResult.fuse(True)
 
@@ -7344,7 +7356,7 @@ class Scheduler:
                 and self.get_backend(device).has_sub_parent_epilogue(fused_nodes)
             )
         ):
-            return FusionResult.fuse(True)
+            return FusionResult.fuse(not template_reduction)
 
         if (
             node1.is_template()
@@ -7555,7 +7567,7 @@ class Scheduler:
                 return True
 
             if has_atomic_add:
-                if not epilogue_fusion:
+                if not epilogue_fusion or template_reduction:
                     return FusionResult.fuse(False)
 
                 for hint_override in [*config.multi_kernel_hints, None]:
@@ -10626,6 +10638,7 @@ class Scheduler:
                 or (
                     node2.is_reduction()
                     and not backend.can_fuse_reduction_epilogue(node1, node2)
+                    and not backend.can_fuse_template_reduction_epilogue(node1, node2)
                 )
                 or not _is_epilogue_fusion_enabled(node1)
             ):
@@ -12943,6 +12956,13 @@ class BaseScheduling:  # noqa: docstring_linter
     def can_fuse_reduction_epilogue(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
+        return False
+
+    def can_fuse_template_reduction_epilogue(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> bool:
+        """Whether reductions in node2 may join template node1's epilogue,
+        subject to the ordinary vertical fusion checks."""
         return False
 
     def can_fuse_reduction_pair(

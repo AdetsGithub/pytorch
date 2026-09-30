@@ -4961,6 +4961,9 @@ class ClassMethodDescriptorVariable(DescriptorVariable):
 # callable into the descriptor's instance dict, skipping the ones it does not
 # have. The instance dict is read before the type's own attribute of the same
 # name, so e.g. staticmethod(f).__doc__ is f.__doc__, not staticmethod.__doc__.
+# Dynamo resolves them through the traced callable: materializing the descriptor
+# to read that dict would rebuild the callable, which is inexact for synthesized
+# functions (NestedUserFunctionVariable) and unavailable for wrapper VTs.
 # https://github.com/python/cpython/blob/3.13/Objects/funcobject.c#L1090-L1117
 _WRAPS_COPIED_ATTRS = frozenset(
     ("__module__", "__name__", "__qualname__", "__doc__", "__annotations__")
@@ -5063,11 +5066,6 @@ class ClassMethodVariable(VariableTracker):
     https://github.com/python/cpython/blob/3.13/Objects/funcobject.c#L1215-L1227
     """
 
-    _nonvar_fields = {
-        "from_class_attr",
-        *VariableTracker._nonvar_fields,
-    }
-
     # cm_memberlist: both members are readonly aliases of the wrapped callable.
     # https://github.com/python/cpython/blob/3.13/Objects/funcobject.c#L1261-L1265
     tp_members = {
@@ -5075,18 +5073,9 @@ class ClassMethodVariable(VariableTracker):
         "__wrapped__": Member(lambda s, _: s.descriptor, readonly_setter),
     }
 
-    def __init__(
-        self,
-        descriptor: VariableTracker,
-        from_class_attr: bool = False,
-        **kwargs: Any,
-    ) -> None:
+    def __init__(self, descriptor: VariableTracker, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.descriptor = descriptor
-        # True only for a descriptor read off a class, where the bound method is
-        # genuinely addressable as `owner.<func name>`. A `classmethod(...)`
-        # built by user code has no such attribute, so it must stay sourceless.
-        self.from_class_attr = from_class_attr
 
     @classmethod
     def from_descriptor(
@@ -5095,10 +5084,11 @@ class ClassMethodVariable(VariableTracker):
         source: "Source | None" = None,
     ) -> "ClassMethodVariable":
         func_source = AttrSource(source, "__func__") if source else None
-        return cls(
+        # Being in a class __dict__ is what makes the bound method addressable
+        # as `owner.<func name>`, so build the VT that can source it.
+        return ClassAttrClassMethodVariable(
             UserFunctionVariable(descriptor.__func__, source=func_source),
             source=source,
-            from_class_attr=True,
         )
 
     def __repr__(self) -> str:
@@ -5119,6 +5109,16 @@ class ClassMethodVariable(VariableTracker):
     ) -> VariableTracker | None:
         return _lookup_wraps_copied_attr(tx, self.descriptor, name)
 
+    def _bound_source(
+        self, owner: VariableTracker, func: BaseUserFunctionVariable
+    ) -> "Source | None":
+        """Source naming the bound method, or None when it has none.
+
+        A `classmethod(...)` built by user code is not an entry in a class
+        __dict__, so `owner.<func name>` does not name its bound method.
+        """
+        return None
+
     def tp_descr_get_impl(
         self,
         tx: "InstructionTranslatorBase",
@@ -5138,11 +5138,7 @@ class ClassMethodVariable(VariableTracker):
                 "Python function to its class.",
                 hints=[*graph_break_hints.SUPPORTABLE],
             )
-        bound_source = (
-            AttrSource(owner.source, func.get_name())
-            if self.from_class_attr and owner.source
-            else None
-        )
+        bound_source = self._bound_source(owner, func)
         if func.source is None and bound_source is not None:
             # The descriptor had no source of its own (C().f, where the class
             # came from obj.__class__), so take the function source from the
@@ -5163,6 +5159,19 @@ class ClassMethodVariable(VariableTracker):
         )
         codegen(self.descriptor)
         codegen.extend_output(create_call_function(1, False))
+
+
+class ClassAttrClassMethodVariable(ClassMethodVariable):
+    """classmethod found in a class __dict__, built by from_descriptor.
+
+    Unlike `classmethod(f)` built by user code, `owner.<func name>` names its
+    bound method, so that is a valid source for guards and reconstruction.
+    """
+
+    def _bound_source(
+        self, owner: VariableTracker, func: BaseUserFunctionVariable
+    ) -> "Source | None":
+        return AttrSource(owner.source, func.get_name()) if owner.source else None
 
 
 class MemberDescriptorVariable(DescriptorVariable):

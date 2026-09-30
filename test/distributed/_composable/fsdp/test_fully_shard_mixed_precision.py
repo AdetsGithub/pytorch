@@ -160,10 +160,14 @@ class TestFullyShardMixedPrecisionTraining(FSDPTestContinuous):
 
         torch.manual_seed(42 + self.rank + 1)
         inp = torch.randn((4, 16), device=device_type.type, dtype=param_dtype)
+        copy_in_dtypes = []
         for iter_idx in range(10):
             optim.zero_grad(set_to_none=(iter_idx % 2 == 0))
             fsdp_loss = model(inp).sum()
-            with patch_reduce_scatter(reduce_scatter):
+            with (
+                patch_reduce_scatter(reduce_scatter),
+                record_copy_in_dtypes(copy_in_dtypes),
+            ):
                 fsdp_loss.backward()
             optim.step()
 
@@ -196,6 +200,9 @@ class TestFullyShardMixedPrecisionTraining(FSDPTestContinuous):
 
             self.assertEqual(fsdp_loss, ref_loss)
             check_sharded_parity(self, ref_model, model)
+        # The fp32 upcast of fresh gradients is deferred to the copy-in
+        copied_dtypes = {dtype for dtypes in copy_in_dtypes for dtype in dtypes}
+        self.assertEqual(copied_dtypes, {param_dtype})
 
     @skipIfRocmVersionLessThan((7, 0))
     @skip_if_lt_x_gpu(2)
@@ -315,8 +322,14 @@ class TestFullyShardMixedPrecisionTraining(FSDPTestContinuous):
         reduce_scatter = functools.partial(
             reduce_scatter_with_assert, self, orig_reduce_scatter, assert_fn
         )
-        with patch_reduce_scatter(reduce_scatter):
+        copy_in_dtypes = []
+        with (
+            patch_reduce_scatter(reduce_scatter),
+            record_copy_in_dtypes(copy_in_dtypes),
+        ):
             model(inp).sum().backward()
+        # Parameters unfrozen after lazy init also defer their upcast
+        self.assertEqual(copy_in_dtypes, [(torch.bfloat16,) * 4])
         for param in model.parameters():
             if param.grad is not None:
                 self.assertEqual(param.grad.dtype, torch.float32)
@@ -477,6 +490,79 @@ class TestFullyShardMixedPrecisionTraining(FSDPTestContinuous):
         for param in module.parameters():
             if param.grad is not None:
                 param.grad.div_(group.size())
+
+    @skip_if_lt_x_gpu(2)
+    def test_grad_dtype_deferred_upcast_keeps_fp32_grad(self):
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.ones(8, device=device_type))
+                # Not representable in bf16
+                scale = torch.full((8,), 1 + 2**-10, device=device_type)
+                self.register_buffer("scale", scale)
+
+            def forward(self):
+                # The fp32 buffer makes the bf16 weight's gradient fp32
+                return (self.weight * self.scale).sum()
+
+        model = Model()
+        fully_shard(model, mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16))
+        model().backward()
+        self.assertEqual(model.weight.grad.full_tensor(), model.scale)
+
+    @skip_if_lt_x_gpu(2)
+    def test_grad_dtype_accumulation_skips_upcast(self):
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.ones(8, device=device_type))
+
+            def forward(self, inp):
+                return (self.weight * inp).sum()
+
+        model = Model()
+        fully_shard(model, mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16))
+        model.unshard()
+        unsharded_weight = model.weight
+        model.reshard()
+        grad_dtypes = []
+        unsharded_weight.register_hook(lambda grad: grad_dtypes.append(grad.dtype))
+        # 256 + 1 is 256 in bf16
+        for value, sync in ((256.0, False), (1.0, False), (-256.0, True)):
+            model.set_requires_gradient_sync(sync)
+            inp = torch.full((8,), value, device=device_type)
+            model(inp).backward()
+            self.assertEqual(unsharded_weight.grad_dtype, torch.float32)
+        # Only the gradient that starts accumulation is cast; AccumulateGrad
+        # adds the later ones to it in place
+        self.assertEqual(grad_dtypes, [torch.float32, torch.bfloat16, torch.bfloat16])
+        self.assertEqual(model.weight.grad.full_tensor(), torch.ones_like(inp))
+
+    @skip_if_lt_x_gpu(2)
+    def test_grad_dtype_restored_after_deferred_upcast(self):
+        model = nn.Linear(8, 8, bias=False, device=device_type)
+        fully_shard(model, mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16))
+        inp = torch.ones(2, 8, device=device_type)
+        # The output hooks run after pre-backward defers the upcast
+        out = model(inp)
+        out.register_hook(lambda grad: model.set_requires_gradient_sync(False))
+        out.sum().backward()
+        model.unshard()
+        self.assertEqual(model.weight.grad.dtype, torch.float32)
+        self.assertEqual(model.weight.grad_dtype, torch.float32)
+        model.reshard()
+
+        def abort_backward(grad: torch.Tensor):
+            raise RuntimeError("abort backward")
+
+        model.set_requires_gradient_sync(True)
+        out = model(inp)
+        out.register_hook(abort_backward)
+        with self.assertRaisesRegex(RuntimeError, "abort backward"):
+            out.sum().backward()
+        model.reset_iter_state()
+        model.unshard()
+        self.assertEqual(model.weight.grad_dtype, torch.float32)
 
     @skip_if_lt_x_gpu(2)
     def test_grad_pending_all_reduce_buffer(self):
@@ -691,10 +777,10 @@ class TestFullyShardMixedPrecisionTraining(FSDPTestContinuous):
             record_copy_in_dtypes(copy_in_dtypes),
         ):
             model(inp, use_first=self.rank == 0).sum().backward()
-        # The gradients reach the fp32 reduce-scatter uncast, grouped by dtype
+        # The weights defer their fp32 upcast to the reduce-scatter copy-in
         rs_input = reduce_scatter.call_args.kwargs["input"]
         self.assertEqual(rs_input.dtype, torch.float32)
-        self.assertEqual(copy_in_dtypes, [(torch.float32,) * 2 + (torch.bfloat16,) * 2])
+        self.assertEqual(copy_in_dtypes, [(torch.bfloat16,) * 4])
         second_sum = self.world_size * (self.world_size + 1) // 2 - 1
         for param, dtype, total in zip(
             model.parameters(),

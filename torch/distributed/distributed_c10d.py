@@ -1953,6 +1953,19 @@ def _check_tensor_list(param: object, param_name: str) -> None:
         )
 
 
+def _check_collective_config(
+    group: ProcessGroup | C10DBackend | None, tensor: torch.Tensor
+) -> None:
+    group = group or _get_default_group()
+    backend = (
+        group if isinstance(group, C10DBackend) else group._get_backend(tensor.device)
+    )
+    if backend.name() != "nccl2":
+        raise RuntimeError(
+            "Per-collective configuration is only supported by the nccl2 backend"
+        )
+
+
 def _group_or_default_group(group: ProcessGroup | None = None) -> ProcessGroup:
     if group is None or group is GroupMember.WORLD:
         group = _get_default_group()
@@ -3763,7 +3776,14 @@ def _coalescing_manager(
     if device:
         group._start_coalescing(device)
     cm = _CoalescingManager()
-    yield cm
+    try:
+        yield cm
+    except BaseException:
+        _world.pg_coalesce_state.pop(group)
+        if device:
+            group._end_coalescing(device)
+        raise
+
     work = None
     op_list = _world.pg_coalesce_state.pop(group)
     if op_list:
@@ -3875,8 +3895,10 @@ def _time_estimator(
         )
     backend._start_time_estimate()
     cm = _TimeEstimator()
-    yield cm
-    cm.estimated_time = backend._end_time_estimate()
+    try:
+        yield cm
+    finally:
+        cm.estimated_time = backend._end_time_estimate()
 
 
 def batch_isend_irecv(p2p_op_list: list[P2POp]) -> list[Work]:

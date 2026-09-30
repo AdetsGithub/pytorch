@@ -219,6 +219,14 @@ class C10_API SymNodeImpl : public c10::intrusive_ptr_target {
   virtual bool has_hint() {
     TORCH_CHECK(false, "NYI");
   }
+  // The hint used for guarding decisions, if the node has one.
+  virtual std::optional<int64_t> guarding_hint() {
+    return std::nullopt;
+  }
+  // Whether torch.fx.experimental._config.backed_size_oblivious is set.
+  virtual bool backed_size_oblivious() {
+    return false;
+  }
   virtual std::string str() {
     TORCH_CHECK(false, "NYI");
   }

@@ -56,8 +56,8 @@ from torch.testing._internal.common_distributed import (
     skip_if_rocm_ver_lessthan_multiprocess,
 )
 from torch.testing._internal.common_utils import (
-    getRocmVersion,
     get_cycles_per_ms,
+    getRocmVersion,
     instantiate_parametrized_tests,
     isRocmArchAnyOf,
     lazy_skip_if,

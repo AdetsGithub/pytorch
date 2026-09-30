@@ -7613,7 +7613,20 @@ class Scheduler:
                     multi_node.finalize_as_triton_caller(best)
                 return FusionResult.fuse(True)
 
-            if bench_epilogue:
+            if bench_epilogue and isinstance(node2, FusedMixOrderReductions):
+                self.current_device = device
+                timed = self.get_backend(device).benchmark_mix_order_reduction(node2)
+                if timed is not None:
+                    ms2, path2 = timed
+                else:
+                    # Time the two reductions as separate kernels, which
+                    # overestimates the unfused time by one read of the output.
+                    (ms_a, path2), (ms_b, _) = (
+                        self.benchmark_fused_nodes(n.get_nodes())
+                        for n in (node2.node1, node2.node2)
+                    )
+                    ms2 = ms_a + ms_b
+            elif bench_epilogue:
                 ms2, path2 = (
                     self.benchmark_fused_nodes(node_list_2)
                     if epilogue_fusion
@@ -10409,7 +10422,10 @@ class Scheduler:
             if self._fusion_blocked_by_placement(node1, node2):
                 return False
             return node1.can_fuse_with(node2)
-        if isinstance(node2, FusedMixOrderReductions):
+        if isinstance(node2, FusedMixOrderReductions) and not (
+            config.triton.template_reduction_epilogue
+            and isinstance(node1.get_template_node(), ir.TritonTemplateBuffer)
+        ):
             return False
 
         return self._can_fuse(
@@ -13148,6 +13164,15 @@ class BaseScheduling:  # noqa: docstring_linter
         in milliseconds on randomly generated inputs.
         """
         raise NotImplementedError
+
+    def benchmark_mix_order_reduction(
+        self, node: FusedMixOrderReductions
+    ) -> tuple[float, str] | None:
+        """
+        Benchmark the kernel codegen_mix_order_reduction would emit for node,
+        or return None if the backend can't.
+        """
+        return None
 
     def get_fusion_pair_priority(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
